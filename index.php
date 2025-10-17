@@ -7,12 +7,20 @@ require_once __DIR__ . '/protect.php';
 // Include functions
 require_once __DIR__ . '/functions.php';
 
+// --- Determine if connection is secure (support proxies using X-Forwarded-Proto) ---
+$isSecure = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ||
+    (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https');
+
 // --- Security Headers ---
-header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:");
 header("X-Frame-Options: DENY");
 header("X-Content-Type-Options: nosniff");
 header("Referrer-Policy: no-referrer-when-downgrade");
 header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
+// Add HSTS when served over HTTPS (including behind proxies that set X-Forwarded-Proto)
+if ($isSecure) {
+    header('Strict-Transport-Security: max-age=63072000; includeSubDomains; preload');
+}
 
 // --- Configuration ---
 $pagesDir = __DIR__ . '/pages';
@@ -43,6 +51,9 @@ foreach ([$pagesDir, $uploadsDir] as $dir) {
 ini_set('session.cookie_httponly', '1');
 ini_set('session.use_only_cookies', '1');
 
+// Use secure flag detection that accounts for reverse proxies
+$cookieSecure = $isSecure;
+
 // Automatically detect directory for session path isolation
 $scriptPath = dirname($_SERVER['SCRIPT_NAME']);
 if ($scriptPath === '/') {
@@ -54,7 +65,7 @@ if ($scriptPath === '/') {
 session_set_cookie_params([
     'lifetime' => 3600,
     'path' => $scriptPath,
-    'secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
+    'secure' => $cookieSecure,
     'httponly' => true,
     'samesite' => 'Strict'
 ]);
@@ -68,6 +79,36 @@ session_save_path($sessionPath);
 
 session_start();
 
+// Helper to terminate a session cleanly and remove the session cookie
+function endSession(): void
+{
+    // Unset all session variables
+    $_SESSION = [];
+
+    // If cookies are used, delete the session cookie
+    if (ini_get('session.use_cookies')) {
+        $params = session_get_cookie_params();
+        // Use array options for setcookie where available
+        $cookieOpts = [
+            'expires' => time() - 42000,
+            'path' => $params['path'] ?? '/',
+            'domain' => $params['domain'] ?? '',
+            'secure' => $params['secure'] ?? false,
+            'httponly' => $params['httponly'] ?? true,
+        ];
+        if (PHP_VERSION_ID >= 70300) {
+            // Preserve samesite when supported
+            $cookieOpts['samesite'] = $params['samesite'] ?? 'Strict';
+            setcookie(session_name(), '', $cookieOpts);
+        } else {
+            setcookie(session_name(), '', $cookieOpts['expires'], $cookieOpts['path'] . '; samesite=Strict', $cookieOpts['domain'], $cookieOpts['secure'], $cookieOpts['httponly']);
+        }
+    }
+
+    // Destroy server-side session data
+    session_destroy();
+}
+
 // Regenerate session ID to prevent session fixation
 if (!isset($_SESSION['init'])) {
     session_regenerate_id(true);
@@ -77,7 +118,7 @@ if (!isset($_SESSION['init'])) {
 
 // Session timeout (1 hour)
 if (isset($_SESSION['created']) && (time() - $_SESSION['created'] > 3600)) {
-    session_destroy();
+    endSession();
     session_start();
 }
 
@@ -102,11 +143,13 @@ if (!isset($_SESSION['failed_attempts'])) {
 $error = '';
 if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['password'])) {
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        http_response_code(400);
         die("Security error: Invalid request");
     }
 
     $timeSinceLastAttempt = time() - $_SESSION['last_attempt'];
     if ($_SESSION['failed_attempts'] >= 5 && $timeSinceLastAttempt < 300) {
+        http_response_code(429);
         die("Too many failed login attempts. Please try again in 5 minutes.");
     }
 
@@ -134,7 +177,7 @@ if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['passw
 
 // --- Handle logout ---
 if (isset($_GET['logout'])) {
-    session_destroy();
+    endSession();
     header("Location: index.php");
     exit;
 }
@@ -142,7 +185,7 @@ if (isset($_GET['logout'])) {
 // --- Activity timeout check ---
 if (isset($_SESSION['loggedin']) && isset($_SESSION['last_activity'])) {
     if (time() - $_SESSION['last_activity'] > 1800) {
-        session_destroy();
+        endSession();
         header("Location: index.php");
         exit;
     }
@@ -276,6 +319,7 @@ $isEditing = isset($_GET['edit']) && ($_SESSION['loggedin'] ?? false);
 $uploadMessage = '';
 if (isset($_FILES['image']) && $_FILES['image']['error'] !== UPLOAD_ERR_NO_FILE) {
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        http_response_code(400);
         die("Security error: Invalid request");
     }
     
@@ -297,10 +341,12 @@ if (isset($_FILES['image']) && $_FILES['image']['error'] !== UPLOAD_ERR_NO_FILE)
 // --- Save edits ---
 if ($isEditing && isset($_POST['content']) && !isset($_POST['upload_only'])) {
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        http_response_code(400);
         die("Security error: Invalid request");
     }
     
     if (strlen($_POST['content']) > 1048576) {
+        http_response_code(413);
         die("Content too large");
     }
     
@@ -312,6 +358,7 @@ if ($isEditing && isset($_POST['content']) && !isset($_POST['upload_only'])) {
     $result = file_put_contents("$pagesDir/$pageSafe.md", $newContent, LOCK_EX);
     
     if ($result === false) {
+        http_response_code(500);
         die("Error: Failed to save the file.");
     }
     
@@ -388,7 +435,7 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
                 <button type="button" onclick="formatText('**', '**')"><b>B</b></button>
                 <button type="button" onclick="formatText('*', '*')"><i>I</i></button>
                 <button type="button" onclick="insertLink()">Link</button>
-                <label for="image-upload" style="cursor: pointer; padding: 0.4em 0.8em; border: 1px solid #888; border-radius: 4px; background-color: #f0f0f0; display: inline-block; margin-right: 0.3em;">
+                <label for="image-upload" style="cursor: pointer; padding: 0.4em 0.8em; border: 1px solid #888; border-radius: 4px; background-color: #f0f0f0; display: inline-block; margin-right:[...]">
                     📷 Image
                 </label>
                 <input type="file" id="image-upload" name="image" accept="image/*" style="display: none;" onchange="uploadImage()">
@@ -502,20 +549,20 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
                 textarea.focus();
                 textarea.selectionStart = textarea.selectionEnd = start + formatted.length;
             }
- 
- function showImageHelp() {
-    alert('Image Alignment:\n\n' +
-          '![alt](url){.center} - Center image\n' +
-          '![alt](url){.left} - Float left\n' +
-          '![alt](url){.right} - Float right\n\n' +
-          'Image Sizes:\n\n' +
-          '{.small} - 300px max\n' +
-          '{.medium} - 600px max\n' +
-          '{.large} - 900px max\n' +
-          '{.full} - Full width\n\n' +
-          'Combine them:\n' +
-          '![alt](url){.left .small}');
-}
+     
+     function showImageHelp() {
+        alert('Image Alignment:\n\n' +
+              '![alt](url){.center} - Center image\n' +
+              '![alt](url){.left} - Float left\n' +
+              '![alt](url){.right} - Float right\n\n' +
+              'Image Sizes:\n\n' +
+              '{.small} - 300px max\n' +
+              '{.medium} - 600px max\n' +
+              '{.large} - 900px max\n' +
+              '{.full} - Full width\n\n' +
+              'Combine them:\n' +
+              '![alt](url){.left .small}');
+    }
 
         </script>
     <?php else: ?>

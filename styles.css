@@ -1,0 +1,183 @@
+/* General Styles */
+body {
+    font-family: sans-serif;
+    margin: 0 auto;
+    padding: 1em;
+    max-width: 1000px;
+}
+
+/* Navigation */
+nav a {
+    margin-right: 1em;
+    color: #000;
+}
+
+/* Links */
+a {
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+.int {
+    color: green;
+}
+
+.ext {
+    color: blue;
+}
+
+.tag {
+    color: purple;
+}
+
+/* Forms */
+textarea {
+    width: 100%;
+    height: 300px;
+    font-family: monospace;
+    font-size: 1.2em;
+    box-sizing: border-box;
+}
+
+form {
+    margin-top: 1em;
+}
+
+/* Editor Toolbar */
+#toolbar {
+    margin-bottom: 0.5em;
+}
+
+#toolbar button {
+    margin-right: 0.3em;
+    padding: 0.4em 0.8em;
+    font-size: 1em;
+    cursor: pointer;
+    border: 1px solid #888;
+    border-radius: 4px;
+    background-color: #f0f0f0;
+}
+
+#toolbar button:active {
+    background-color: #ddd;
+}
+
+/* Search Results */
+mark {
+    background: yellow;
+    color: black;
+    padding: 0 2px;
+    border-radius: 3px;
+}
+
+.snippet {
+    font-size: 0.97em;
+    color: #555;
+    margin-top: 2px;
+    margin-bottom: 8px;
+    display: block;
+}
+
+/* Error Messages */
+.error {
+    color: red;
+    padding: 10px;
+    background-color: #ffe6e6;
+    border: 1px solid red;
+    border-radius: 4px;
+    margin: 10px 0;
+}
+
+/* Special Pages */
+.tag-link {
+    font-weight: bold;
+}
+
+/* Responsive Design */
+@media (max-width: 600px) {
+    #toolbar button {
+        padding: 0.6em 1em;
+        font-size: 1.2em;
+    }
+}
+
+/* Images */
+img {
+    max-width: 100%;
+    height: auto;
+}
+
+/* Backlinks section */
+h3 {
+    color: #333;
+    font-size: 1.1em;
+    margin-top: 1em;
+}
+
+hr {
+    margin: 2em 0;
+    border: none;
+    border-top: 1px solid #ddd;
+}
+
+/* Related pages styling */
+.tag-match {
+    color: #666;
+    font-size: 0.9em;
+    margin-left: 0.5em;
+}
+
+.tag-match a {
+    font-size: 0.95em;
+}
+/* Image alignment and sizing classes */
+.img-center {
+    display: block;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.img-left {
+    float: left;
+    margin: 0 1em 1em 0;
+}
+
+.img-right {
+    float: right;
+    margin: 0 0 1em 1em;
+}
+
+.img-full {
+    width: 100% !important;
+    max-width: 100% !important;
+    height: auto;
+}
+
+.img-small {
+    max-width: 300px !important;
+    height: auto;
+}
+
+.img-medium {
+    max-width: 600px !important;
+    height: auto;
+}
+
+.img-large {
+    max-width: 900px !important;
+    height: auto;
+}
+
+/* Clear floats */
+.clear {
+    clear: both;
+}
+
+/* Prevent images from breaking layout */
+img {
+    max-width: 100%;
+    height: auto;
+}

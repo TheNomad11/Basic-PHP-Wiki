@@ -1,5 +1,7 @@
 <?php
 declare(strict_types=1);
+// Load configuration
+$config = require_once __DIR__ . '/config.php';
 
 // Protection layer (works on Apache and Nginx)
 require_once __DIR__ . '/protect.php';
@@ -7,27 +9,36 @@ require_once __DIR__ . '/protect.php';
 // Include functions
 require_once __DIR__ . '/functions.php';
 
-// --- Determine if connection is secure (support proxies using X-Forwarded-Proto) ---
-$isSecure = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ||
-    (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https');
+// Generate CSP nonce for this request
+$nonce = generateNonce();
 
 // --- Security Headers ---
-header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$nonce'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none';");
 header("X-Frame-Options: DENY");
 header("X-Content-Type-Options: nosniff");
 header("Referrer-Policy: no-referrer-when-downgrade");
 header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
-// Add HSTS when served over HTTPS (including behind proxies that set X-Forwarded-Proto)
-if ($isSecure) {
-    header('Strict-Transport-Security: max-age=63072000; includeSubDomains; preload');
+header("X-XSS-Protection: 1; mode=block");
+
+// Add these cache control headers
+header("Cache-Control: no-cache, no-store, must-revalidate");
+header("Pragma: no-cache");
+header("Expires: 0");
+
+// Force HTTPS in production
+if (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') {
+    header("Strict-Transport-Security: max-age=31536000; includeSubDomains; preload");
 }
 
-// --- Configuration ---
-$pagesDir = __DIR__ . '/pages';
-$uploadsDir = __DIR__ . '/uploads';
-$defaultPage = 'Home';
-$usersFile = __DIR__ . '/users.json';
-$enableAutoLink = true;
+// Extract config
+$pagesDir = $config['pages_dir'];
+$uploadsDir = $config['uploads_dir'];
+$sessionPath = $config['sessions_dir'];
+$usersFile = $config['users_file'];
+$rateLimitFile = $config['rate_limit_file'];
+$logFile = $config['log_file'];
+$defaultPage = $config['default_page'];
+$enableAutoLink = $config['enable_auto_link'];
 
 // Ensure directories exist with proper permissions
 if (!is_dir($pagesDir)) {
@@ -36,6 +47,10 @@ if (!is_dir($pagesDir)) {
 
 if (!is_dir($uploadsDir)) {
     mkdir($uploadsDir, 0755, true);
+}
+
+if (!is_dir($sessionPath)) {
+    mkdir($sessionPath, 0700, true);
 }
 
 // Create index.php in protected directories to block directory listing
@@ -50,9 +65,7 @@ foreach ([$pagesDir, $uploadsDir] as $dir) {
 // --- Session Security ---
 ini_set('session.cookie_httponly', '1');
 ini_set('session.use_only_cookies', '1');
-
-// Use secure flag detection that accounts for reverse proxies
-$cookieSecure = $isSecure;
+ini_set('session.use_strict_mode', '1');
 
 // Automatically detect directory for session path isolation
 $scriptPath = dirname($_SERVER['SCRIPT_NAME']);
@@ -63,51 +76,15 @@ if ($scriptPath === '/') {
 }
 
 session_set_cookie_params([
-    'lifetime' => 3600,
+    'lifetime' => $config['session_lifetime'],
     'path' => $scriptPath,
-    'secure' => $cookieSecure,
+    'secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
     'httponly' => true,
     'samesite' => 'Strict'
 ]);
 
-// Use separate session save path for each wiki instance
-$sessionPath = __DIR__ . '/sessions';
-if (!is_dir($sessionPath)) {
-    mkdir($sessionPath, 0700, true);
-}
 session_save_path($sessionPath);
-
 session_start();
-
-// Helper to terminate a session cleanly and remove the session cookie
-function endSession(): void
-{
-    // Unset all session variables
-    $_SESSION = [];
-
-    // If cookies are used, delete the session cookie
-    if (ini_get('session.use_cookies')) {
-        $params = session_get_cookie_params();
-        // Use array options for setcookie where available
-        $cookieOpts = [
-            'expires' => time() - 42000,
-            'path' => $params['path'] ?? '/',
-            'domain' => $params['domain'] ?? '',
-            'secure' => $params['secure'] ?? false,
-            'httponly' => $params['httponly'] ?? true,
-        ];
-        if (PHP_VERSION_ID >= 70300) {
-            // Preserve samesite when supported
-            $cookieOpts['samesite'] = $params['samesite'] ?? 'Strict';
-            setcookie(session_name(), '', $cookieOpts);
-        } else {
-            setcookie(session_name(), '', $cookieOpts['expires'], $cookieOpts['path'] . '; samesite=Strict', $cookieOpts['domain'], $cookieOpts['secure'], $cookieOpts['httponly']);
-        }
-    }
-
-    // Destroy server-side session data
-    session_destroy();
-}
 
 // Regenerate session ID to prevent session fixation
 if (!isset($_SESSION['init'])) {
@@ -116,9 +93,11 @@ if (!isset($_SESSION['init'])) {
     $_SESSION['created'] = time();
 }
 
-// Session timeout (1 hour)
-if (isset($_SESSION['created']) && (time() - $_SESSION['created'] > 3600)) {
-    endSession();
+// Session timeout (1 hour absolute)
+if (isset($_SESSION['created']) && (time() - $_SESSION['created'] > $config['session_lifetime'])) {
+    session_unset();
+    session_destroy();
+    clearSessionCookie();
     session_start();
 }
 
@@ -133,64 +112,107 @@ if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
-// --- Rate limiting for login ---
-if (!isset($_SESSION['failed_attempts'])) {
-    $_SESSION['failed_attempts'] = 0;
-    $_SESSION['last_attempt'] = 0;
-}
-
-// --- Handle login ---
+// --- Handle login with IP-based rate limiting ---
 $error = '';
 if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['password'])) {
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
-        http_response_code(400);
+        logMessage('CSRF token mismatch on login', 'WARNING', $logFile);
         die("Security error: Invalid request");
     }
 
-    $timeSinceLastAttempt = time() - $_SESSION['last_attempt'];
-    if ($_SESSION['failed_attempts'] >= 5 && $timeSinceLastAttempt < 300) {
-        http_response_code(429);
-        die("Too many failed login attempts. Please try again in 5 minutes.");
+    $clientIp = getClientIp();
+    
+    // Check IP-based rate limit
+    if (!checkRateLimit($clientIp, $rateLimitFile, $config['max_login_attempts'], $config['login_block_duration'])) {
+        logMessage("Rate limit exceeded for IP: $clientIp", 'WARNING', $logFile);
+        die("Too many failed login attempts. Please try again in " . ($config['login_block_duration'] / 60) . " minutes.");
     }
-
-    $_SESSION['last_attempt'] = time();
     
     $username = $_POST['username'];
     if (!preg_match('/^[a-zA-Z0-9_\-]{3,30}$/', $username)) {
         $error = "Invalid username format.";
+        logMessage("Invalid username format attempted: $username from IP: $clientIp", 'WARNING', $logFile);
     } else {
         if (isset($users[$username]) && password_verify($_POST['password'], $users[$username])) {
             session_regenerate_id(true);
             $_SESSION['loggedin'] = true;
             $_SESSION['user'] = $username;
-            $_SESSION['failed_attempts'] = 0;
             $_SESSION['last_activity'] = time();
+            logMessage("Successful login: $username from IP: $clientIp", 'INFO', $logFile);
             header("Location: index.php");
             exit;
         } else {
-            $_SESSION['failed_attempts']++;
+            recordFailedAttempt($clientIp, $rateLimitFile);
             $error = "Incorrect username or password.";
+            logMessage("Failed login attempt for username: $username from IP: $clientIp", 'WARNING', $logFile);
             sleep(2);
         }
     }
 }
 
-// --- Handle logout ---
+// --- Handle logout with proper cookie clearing ---
 if (isset($_GET['logout'])) {
-    endSession();
+    $username = $_SESSION['user'] ?? 'unknown';
+    $clientIp = getClientIp();
+    logMessage("User logout: $username from IP: $clientIp", 'INFO', $logFile);
+    
+    session_unset();
+    session_destroy();
+    clearSessionCookie();
+    
     header("Location: index.php");
     exit;
 }
 
+
 // --- Activity timeout check ---
 if (isset($_SESSION['loggedin']) && isset($_SESSION['last_activity'])) {
-    if (time() - $_SESSION['last_activity'] > 1800) {
-        endSession();
+    if (time() - $_SESSION['last_activity'] > $config['session_timeout']) {
+        session_unset();
+        session_destroy();
+        clearSessionCookie();
         header("Location: index.php");
         exit;
     }
     $_SESSION['last_activity'] = time();
 }
+
+// ADD THIS SECTION HERE - Simple login requirement
+if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
+    // User is not logged in - show login form
+    if (!isset($_POST['login'])) {
+        // Not attempting to login, show the form
+        ?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login Required - Simple Wiki</title>
+    <link rel="stylesheet" type="text/css" href="styles.css">
+</head>
+<body>
+    <h2>Login Required</h2>
+    <p>Please log in to access this wiki.</p>
+    <?php if (!empty($error)): ?>
+        <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endif; ?>
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+        <label>Username: <input type="text" name="username" required maxlength="30" pattern="[a-zA-Z0-9_\-]{3,30}" autocomplete="username" autofocus></label><br>
+        <label>Password: <input type="password" name="password" required autocomplete="current-password"></label><br>
+        <button type="submit" name="login">Login</button>
+    </form>
+</body>
+</html>
+        <?php
+        exit;
+    }
+    // If $_POST['login'] is set, let the code continue to process the login above
+}
+
+
+
 
 // --- Determine current page ---
 $page = $_GET['page'] ?? $defaultPage;
@@ -209,6 +231,7 @@ if ($realBase === false) {
 $filePath = "$pagesDir/$pageSafe.md";
 $realFilePath = realpath($filePath);
 if ($realFilePath !== false && strpos($realFilePath, $realBase) !== 0) {
+    logMessage("Directory traversal attempt: $filePath", 'ERROR', $logFile);
     die("Security error: Invalid page request");
 }
 
@@ -242,7 +265,7 @@ if (isset($_GET['tag'])) {
             <?php endif; ?>
         </ul>
         <?php
-    });
+    }, $nonce);
     exit;
 }
 
@@ -278,7 +301,7 @@ if ($pageSafe === 'AllTags') {
             <?php endif; ?>
         </div>
         <?php
-    });
+    }, $nonce);
     exit;
 }
 
@@ -302,7 +325,7 @@ if ($pageSafe === 'AllPages') {
             <?php endforeach; ?>
         </ul>
         <?php
-    });
+    }, $nonce);
     exit;
 }
 
@@ -315,39 +338,46 @@ if ($content === false) {
 
 $isEditing = isset($_GET['edit']) && ($_SESSION['loggedin'] ?? false);
 
-// --- Handle image upload ---
+// --- Handle image upload with enhanced validation ---
 $uploadMessage = '';
 if (isset($_FILES['image']) && $_FILES['image']['error'] !== UPLOAD_ERR_NO_FILE) {
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
-        http_response_code(400);
+        logMessage("CSRF token mismatch on image upload", 'WARNING', $logFile);
         die("Security error: Invalid request");
     }
     
-    $result = handleImageUpload($_FILES['image'], $uploadsDir);
+    $result = handleImageUpload(
+        $_FILES['image'], 
+        $uploadsDir, 
+        $config['allowed_image_types'],
+        $config['max_upload_size']
+    );
     
     if ($result['success']) {
         $uploadMessage = 'uploads/' . $result['filename'];
+        $username = $_SESSION['user'] ?? 'unknown';
+        logMessage("Image uploaded: {$result['filename']} by user: $username", 'INFO', $logFile);
         
-        // If this is an AJAX upload (upload_only flag), return minimal HTML
+        // If this is an AJAX upload, return minimal HTML
         if (isset($_POST['upload_only'])) {
             echo '<div class="upload-success" data-markdown="![Image description](' . htmlspecialchars($uploadMessage, ENT_QUOTES, 'UTF-8') . ')"></div>';
             exit;
         }
     } else {
         $error = $result['message'];
+        logMessage("Image upload failed: {$result['message']}", 'WARNING', $logFile);
     }
 }
 
 // --- Save edits ---
 if ($isEditing && isset($_POST['content']) && !isset($_POST['upload_only'])) {
     if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
-        http_response_code(400);
+        logMessage("CSRF token mismatch on save", 'WARNING', $logFile);
         die("Security error: Invalid request");
     }
     
-    if (strlen($_POST['content']) > 1048576) {
-        http_response_code(413);
-        die("Content too large");
+    if (strlen($_POST['content']) > $config['max_content_size']) {
+        die("Content too large (max " . round($config['max_content_size']/1024) . "KB)");
     }
     
     if (!is_dir($pagesDir)) {
@@ -355,14 +385,25 @@ if ($isEditing && isset($_POST['content']) && !isset($_POST['upload_only'])) {
     }
     
     $newContent = $_POST['content'];
-    $result = file_put_contents("$pagesDir/$pageSafe.md", $newContent, LOCK_EX);
+    
+    // Atomic write: write to temp file then rename
+    $tempFile = "$pagesDir/$pageSafe.md.tmp";
+    $result = file_put_contents($tempFile, $newContent, LOCK_EX);
     
     if ($result === false) {
-        http_response_code(500);
+        logMessage("Failed to write temp file: $tempFile", 'ERROR', $logFile);
         die("Error: Failed to save the file.");
     }
     
-    chmod("$pagesDir/$pageSafe.md", 0644);
+    chmod($tempFile, 0644);
+    
+    if (!rename($tempFile, "$pagesDir/$pageSafe.md")) {
+        logMessage("Failed to rename temp file to: $pagesDir/$pageSafe.md", 'ERROR', $logFile);
+        die("Error: Failed to save the file.");
+    }
+    
+    $username = $_SESSION['user'] ?? 'unknown';
+    logMessage("Page saved: $pageSafe by user: $username", 'INFO', $logFile);
     
     header("Location: index.php?page=" . urlencode($pageSafe));
     exit;
@@ -410,7 +451,7 @@ if (isset($_GET['search']) && !empty($_GET['q'])) {
 }
 
 // --- Main page rendering ---
-renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEditing, $content, $page, $pageSafe, $pagesDir, $enableAutoLink, $uploadMessage) {
+renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEditing, $content, $page, $pageSafe, $pagesDir, $enableAutoLink, $uploadMessage, $nonce) {
     if (!empty($error)): ?>
         <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
     <?php endif;
@@ -432,147 +473,31 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
         <form method="post" enctype="multipart/form-data" id="editForm">
             <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
             <div id="toolbar">
-                <button type="button" onclick="formatText('**', '**')"><b>B</b></button>
-                <button type="button" onclick="formatText('*', '*')"><i>I</i></button>
-                <button type="button" onclick="insertLink()">Link</button>
-                <label for="image-upload" style="cursor: pointer; padding: 0.4em 0.8em; border: 1px solid #888; border-radius: 4px; background-color: #f0f0f0; display: inline-block; margin-right:[...]">
+                <button type="button" id="btn-bold"><b>B</b></button>
+                <button type="button" id="btn-italic"><i>I</i></button>
+                <button type="button" id="btn-link">Link</button>
+                <label for="image-upload" style="cursor: pointer; padding: 0.4em 0.8em; border: 1px solid #888; border-radius: 4px; background-color: #f0f0f0; display: inline-block; margin-right: 0.3em;">
                     📷 Image
                 </label>
-                <input type="file" id="image-upload" name="image" accept="image/*" style="display: none;" onchange="uploadImage()">
-                <button type="button" onclick="showImageHelp()" title="Image alignment help">❓</button>
-
+                <input type="file" id="image-upload" name="image" accept="image/*" style="display: none;">
+                <button type="button" id="btn-help" title="Image alignment help">❓</button>
             </div>
             <textarea id="editbox" name="content" autofocus><?= htmlspecialchars($content, ENT_QUOTES, 'UTF-8') ?></textarea>
             <button type="submit" name="save">Save</button>
             <a href="?page=<?= urlencode($page) ?>"><button type="button">Cancel</button></a>
         </form>
-        <script>
-            function uploadImage() {
-                // Show uploading message
-                const toolbar = document.getElementById('toolbar');
-                const uploadStatus = document.createElement('span');
-                uploadStatus.id = 'upload-status';
-                uploadStatus.style.marginLeft = '1em';
-                uploadStatus.style.color = '#0066cc';
-                uploadStatus.textContent = '⏳ Uploading...';
-                toolbar.appendChild(uploadStatus);
-                
-                // Create FormData with image and CSRF token
-                const formData = new FormData();
-                const imageFile = document.getElementById('image-upload').files[0];
-                formData.append('image', imageFile);
-                formData.append('csrf_token', document.querySelector('input[name="csrf_token"]').value);
-                formData.append('upload_only', '1');
-                
-                // Upload via AJAX
-                fetch(window.location.href, {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => response.text())
-                .then(html => {
-                    // Parse response to get upload message
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(html, 'text/html');
-                    const uploadDiv = doc.querySelector('.upload-success');
-                    
-                    if (uploadDiv) {
-                        const markdownCode = uploadDiv.getAttribute('data-markdown');
-                        
-                        // Insert at cursor position
-                        const textarea = document.getElementById('editbox');
-                        const start = textarea.selectionStart;
-                        const end = textarea.selectionEnd;
-                        const before = textarea.value.substring(0, start);
-                        const after = textarea.value.substring(end);
-                        textarea.value = before + markdownCode + after;
-                        
-                        // Update cursor position
-                        const newPos = start + markdownCode.length;
-                        textarea.selectionStart = newPos;
-                        textarea.selectionEnd = newPos;
-                        textarea.focus();
-                        
-                        // Show success message
-                        uploadStatus.textContent = '✓ Image inserted!';
-                        uploadStatus.style.color = '#28a745';
-                        setTimeout(() => uploadStatus.remove(), 3000);
-                    } else {
-                        // Show error
-                        uploadStatus.textContent = '✗ Upload failed';
-                        uploadStatus.style.color = '#dc3545';
-                    }
-                    
-                    // Reset file input
-                    document.getElementById('image-upload').value = '';
-                })
-                .catch(error => {
-                    uploadStatus.textContent = '✗ Upload error';
-                    uploadStatus.style.color = '#dc3545';
-                    console.error('Upload error:', error);
-                });
-            }
-            
-            function formatText(startTag, endTag) {
-                const textarea = document.getElementById("editbox");
-                const start = textarea.selectionStart;
-                const end = textarea.selectionEnd;
-                const selected = textarea.value.substring(start, end);
-                const before = textarea.value.substring(0, start);
-                const after = textarea.value.substring(end);
-                textarea.value = before + startTag + selected + endTag + after;
-                textarea.focus();
-                if (start === end) {
-                    textarea.selectionStart = textarea.selectionEnd = start + startTag.length;
-                } else {
-                    textarea.selectionStart = start;
-                    textarea.selectionEnd = end + startTag.length + endTag.length;
-                }
-            }
-
-            function insertLink() {
-                const url = prompt("Enter the page name or URL for the link:");
-                if (!url) return;
-                const textarea = document.getElementById("editbox");
-                const start = textarea.selectionStart;
-                const end = textarea.selectionEnd;
-                const selected = textarea.value.substring(start, end) || url;
-                const before = textarea.value.substring(0, start);
-                const after = textarea.value.substring(end);
-                let formatted;
-                if (url.match(/^(http|https):\/\//i)) {
-                    formatted = `[${selected}](${url})`;
-                } else {
-                    formatted = `[[${selected}]]`;
-                }
-                textarea.value = before + formatted + after;
-                textarea.focus();
-                textarea.selectionStart = textarea.selectionEnd = start + formatted.length;
-            }
-     
-     function showImageHelp() {
-        alert('Image Alignment:\n\n' +
-              '![alt](url){.center} - Center image\n' +
-              '![alt](url){.left} - Float left\n' +
-              '![alt](url){.right} - Float right\n\n' +
-              'Image Sizes:\n\n' +
-              '{.small} - 300px max\n' +
-              '{.medium} - 600px max\n' +
-              '{.large} - 900px max\n' +
-              '{.full} - Full width\n\n' +
-              'Combine them:\n' +
-              '![alt](url){.left .small}');
-    }
-
-        </script>
+        
+   
     <?php else: ?>
         <h1><?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></h1>
-        <div><?= parseMarkdownWithAutoLink($content, $pagesDir, $page, $enableAutoLink) ?></div>
+         <div><?= parseMarkdownWithAutoLink($content, $pagesDir, $page, $enableAutoLink) ?></div>
+        
+        <div style="clear: both;"></div>
         
         <?php if ($_SESSION['loggedin'] ?? false): ?>
             <p><a href="?page=<?= urlencode($page) ?>&edit=1">Edit this page</a></p>
         <?php endif; ?>
-        
+       
         <?php
         // Display backlinks and related pages
         if (!empty($content)) {
@@ -619,16 +544,5 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
         }
         ?>
     <?php endif;
-
-    if (!($_SESSION['loggedin'] ?? false)): ?>
-        <hr>
-        <h3>Login</h3>
-        <form method="post">
-            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
-            <label>Username: <input type="text" name="username" required maxlength="30" pattern="[a-zA-Z0-9_\-]{3,30}"></label><br>
-            <label>Password: <input type="password" name="password" required></label><br>
-            <button type="submit" name="login">Login</button>
-        </form>
-    <?php endif;
-});
+}, $nonce);
 ?>

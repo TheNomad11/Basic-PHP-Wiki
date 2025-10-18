@@ -4,12 +4,106 @@ body {
     margin: 0 auto;
     padding: 1em;
     max-width: 1000px;
+    line-height: 1.6;
+}
+
+/* Paragraph spacing - proper control now that we use <p> tags */
+p {
+    margin-bottom: 1.2em;
+    margin-top: 0;
+    line-height: 1.6;
+}
+
+/* Universal content spacing */
+h1, h2, h3, h4, h5, h6, ul, ol, pre, blockquote {
+    margin-bottom: 1em;
+}
+
+/* Specific heading adjustments */
+h1 { margin-bottom: 0.8em; margin-top: 1.2em; }
+h2 { margin-bottom: 0.7em; margin-top: 1em; }
+h3 { margin-bottom: 0.6em; margin-top: 0.8em; }
+
+/* Lists */
+ul, ol {
+    margin-bottom: 1em;
+    margin-top: 0.5em;
+    padding-left: 2em;
+}
+
+li {
+    margin-bottom: 0.3em;
+}
+
+/* Clear floats before backlinks/related section */
+hr {
+    clear: both;
+}
+
+/* Or more specific - clear before backlinks */
+h3 {
+    clear: both;
+}
+
+/* Tags should clear floats and appear below images */
+.tag {
+    display: inline-block;
+}
+
+/* If tags are at the end of content, ensure they clear floats */
+p:has(.tag) {
+    clear: both;
+}
+
+
+
+/* Code blocks */
+pre {
+    background-color: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 16px;
+    overflow-x: auto;
+    margin: 1.5em 0;
+}
+
+code {
+    background-color: #f6f8fa;
+    border-radius: 3px;
+    padding: 0.2em 0.4em;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.9em;
+}
+
+pre code {
+    background-color: transparent;
+    padding: 0;
+    border-radius: 0;
+}
+
+/* Blockquotes */
+blockquote {
+    border-left: 4px solid #ddd;
+    padding-left: 1em;
+    margin-left: 0;
+    color: #666;
+    font-style: italic;
 }
 
 /* Navigation */
+nav {
+    margin-bottom: 1.5em;
+    padding-bottom: 0.5em;
+    border-bottom: 1px solid #ddd;
+}
+
 nav a {
     margin-right: 1em;
     color: #000;
+}
+
+nav form {
+    display: inline;
 }
 
 /* Links */
@@ -31,6 +125,7 @@ a:hover {
 
 .tag {
     color: purple;
+    font-weight: 500;
 }
 
 /* Forms */
@@ -40,10 +135,43 @@ textarea {
     font-family: monospace;
     font-size: 1.2em;
     box-sizing: border-box;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    padding: 0.5em;
 }
 
 form {
     margin-top: 1em;
+}
+
+input[type="text"],
+input[type="password"] {
+    padding: 0.5em;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 1em;
+}
+
+button {
+    padding: 0.5em 1em;
+    background-color: #0066cc;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 1em;
+}
+
+button:hover {
+    background-color: #0052a3;
+}
+
+button[type="button"] {
+    background-color: #666;
+}
+
+button[type="button"]:hover {
+    background-color: #555;
 }
 
 /* Editor Toolbar */
@@ -51,7 +179,7 @@ form {
     margin-bottom: 0.5em;
 }
 
-#toolbar button {
+#toolbar button, #toolbar label {
     margin-right: 0.3em;
     padding: 0.4em 0.8em;
     font-size: 1em;
@@ -59,6 +187,11 @@ form {
     border: 1px solid #888;
     border-radius: 4px;
     background-color: #f0f0f0;
+    color: #333;
+}
+
+#toolbar button:hover, #toolbar label:hover {
+    background-color: #e0e0e0;
 }
 
 #toolbar button:active {
@@ -83,10 +216,10 @@ mark {
 
 /* Error Messages */
 .error {
-    color: red;
+    color: #721c24;
     padding: 10px;
-    background-color: #ffe6e6;
-    border: 1px solid red;
+    background-color: #f8d7da;
+    border: 1px solid #f5c6cb;
     border-radius: 4px;
     margin: 10px 0;
 }
@@ -94,33 +227,15 @@ mark {
 /* Special Pages */
 .tag-link {
     font-weight: bold;
+    margin-right: 0.8em;
+    display: inline-block;
+    padding: 0.2em 0.5em;
+    background-color: #f0f0f0;
+    border-radius: 3px;
 }
 
-/* Responsive Design */
-@media (max-width: 600px) {
-    #toolbar button {
-        padding: 0.6em 1em;
-        font-size: 1.2em;
-    }
-}
-
-/* Images */
-img {
-    max-width: 100%;
-    height: auto;
-}
-
-/* Backlinks section */
-h3 {
-    color: #333;
-    font-size: 1.1em;
-    margin-top: 1em;
-}
-
-hr {
-    margin: 2em 0;
-    border: none;
-    border-top: 1px solid #ddd;
+.tag-link:hover {
+    background-color: #e0e0e0;
 }
 
 /* Related pages styling */
@@ -133,11 +248,27 @@ hr {
 .tag-match a {
     font-size: 0.95em;
 }
+
+/* Backlinks section */
+h3 {
+    color: #333;
+    font-size: 1.1em;
+    margin-top: 1.5em;
+}
+
+hr {
+    margin: 2em 0;
+    border: none;
+    border-top: 1px solid #ddd;
+}
+
 /* Image alignment and sizing classes */
 .img-center {
     display: block;
     margin-left: auto;
     margin-right: auto;
+    margin-top: 1em;
+    margin-bottom: 1em;
 }
 
 .img-left {
@@ -180,4 +311,126 @@ hr {
 img {
     max-width: 100%;
     height: auto;
+    border-radius: 4px;
+}
+
+/* Tables (if you add them later) */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+}
+
+th, td {
+    border: 1px solid #ddd;
+    padding: 0.5em;
+    text-align: left;
+}
+
+th {
+    background-color: #f0f0f0;
+    font-weight: bold;
+}
+
+/* Responsive Design */
+@media (max-width: 600px) {
+    body {
+        padding: 0.5em;
+    }
+    
+    img {
+        width: 100%;
+    }
+    
+    #toolbar button, #toolbar label {
+        padding: 0.6em 1em;
+        font-size: 1.2em;
+    }
+    
+    textarea {
+        font-size: 1em;
+        height: 250px;
+    }
+}
+
+/* Code block wrapper */
+.code-block-wrapper {
+    position: relative;
+    margin: 1.5em 0;
+}
+
+.code-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background-color: #e8eaed;
+    padding: 0.5em 1em;
+    border-radius: 6px 6px 0 0;
+    border: 1px solid #d0d7de;
+    border-bottom: none;
+}
+
+.code-lang {
+    font-size: 0.85em;
+    font-weight: 600;
+    color: #666;
+    text-transform: uppercase;
+}
+
+.code-block-wrapper pre {
+    margin: 0;
+    border-radius: 0 0 6px 6px;
+    border-top: none;
+}
+
+.copy-btn {
+    padding: 0.3em 0.8em;
+    font-size: 0.85em;
+    background-color: #fff;
+    color: #333;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.copy-btn:hover {
+    background-color: #f0f0f0;
+    border-color: #999;
+}
+
+.copy-btn:active,
+.copy-btn.copied {
+    background-color: #28a745;
+    color: white;
+    border-color: #28a745;
+}
+/* Inline code styling */
+code {
+    background-color: #f6f8fa;
+    border-radius: 3px;
+    padding: 0.2em 0.4em;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.9em;
+    color: #d73a49;
+    border: 1px solid #e1e4e8;
+}
+
+/* Code blocks styling */
+pre {
+    background-color: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 16px;
+    overflow-x: auto;
+    margin: 1.5em 0;
+}
+
+pre code {
+    background-color: transparent;
+    padding: 0;
+    border-radius: 0;
+    font-size: 0.95em;
+    color: #24292f;
+    border: none;
 }

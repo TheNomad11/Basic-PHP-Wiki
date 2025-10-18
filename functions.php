@@ -1,104 +1,264 @@
 <?php
 declare(strict_types=1);
+// Require Parsedown
+require_once 'Parsedown.php';
 
 /**
- * Parse markdown text to HTML
- * @param string $text Raw markdown content
- * @return string HTML output
+ * Simple logging function
+ * @param string $message Log message
+ * @param string $level Log level (INFO, WARNING, ERROR)
+ * @param string $logFile Path to log file
  */
+function logMessage(string $message, string $level = 'INFO', string $logFile = ''): void
+{
+    if (empty($logFile)) {
+        return;
+    }
+    
+    $timestamp = date('Y-m-d H:i:s');
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $logEntry = "[$timestamp] [$level] [$ip] $message\n";
+    
+    file_put_contents($logFile, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Get client IP address (handles proxies)
+ * @return string IP address
+ */
+function getClientIp(): string
+{
+    $ipKeys = ['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR'];
+    
+    foreach ($ipKeys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $ips = explode(',', $_SERVER[$key]);
+            $ip = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+    }
+    
+    return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+}
+
+/**
+ * Check rate limit for IP address
+ * @param string $ip IP address
+ * @param string $rateLimitFile Path to rate limit file
+ * @param int $maxAttempts Maximum attempts allowed
+ * @param int $blockDuration Block duration in seconds
+ * @return bool True if allowed, false if rate limited
+ */
+function checkRateLimit(string $ip, string $rateLimitFile, int $maxAttempts, int $blockDuration): bool
+{
+    $rateLimits = [];
+    
+    if (file_exists($rateLimitFile)) {
+        $data = file_get_contents($rateLimitFile);
+        $rateLimits = json_decode($data, true) ?? [];
+    }
+    
+    // Clean up old entries
+    $now = time();
+    foreach ($rateLimits as $key => $data) {
+        if ($now - $data['timestamp'] > $blockDuration) {
+            unset($rateLimits[$key]);
+        }
+    }
+    
+    // Check current IP
+    if (!isset($rateLimits[$ip])) {
+        $rateLimits[$ip] = ['attempts' => 0, 'timestamp' => $now];
+    }
+    
+    $ipData = $rateLimits[$ip];
+    
+    // Check if blocked
+    if ($ipData['attempts'] >= $maxAttempts) {
+        $timeSinceFirst = $now - $ipData['timestamp'];
+        if ($timeSinceFirst < $blockDuration) {
+            return false;
+        } else {
+            // Reset after block duration
+            $rateLimits[$ip] = ['attempts' => 0, 'timestamp' => $now];
+        }
+    }
+    
+    // Save and return
+    file_put_contents($rateLimitFile, json_encode($rateLimits), LOCK_EX);
+    return true;
+}
+
+/**
+ * Record failed login attempt
+ * @param string $ip IP address
+ * @param string $rateLimitFile Path to rate limit file
+ */
+function recordFailedAttempt(string $ip, string $rateLimitFile): void
+{
+    $rateLimits = [];
+    
+    if (file_exists($rateLimitFile)) {
+        $data = file_get_contents($rateLimitFile);
+        $rateLimits = json_decode($data, true) ?? [];
+    }
+    
+    if (!isset($rateLimits[$ip])) {
+        $rateLimits[$ip] = ['attempts' => 0, 'timestamp' => time()];
+    }
+    
+    $rateLimits[$ip]['attempts']++;
+    
+    file_put_contents($rateLimitFile, json_encode($rateLimits), LOCK_EX);
+}
+
+/**
+ * Clear session cookie properly
+ */
+function clearSessionCookie(): void
+{
+    if (isset($_COOKIE[session_name()])) {
+        $params = session_get_cookie_params();
+        setcookie(
+            session_name(),
+            '',
+            time() - 42000,
+            $params['path'],
+            $params['domain'],
+            $params['secure'],
+            $params['httponly']
+        );
+    }
+}
+
+/**
+ * Handle image upload with enhanced security validation
+ * @param array $file File from $_FILES
+ * @param string $uploadsDir Directory for uploads
+ * @param array $allowedTypes Allowed image types
+ * @param int $maxSize Maximum file size
+ * @return array Result with 'success' boolean and 'message' or 'filename'
+ */
+function handleImageUpload(array $file, string $uploadsDir, array $allowedTypes, int $maxSize): array
+{
+    // Check for upload errors
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        return ['success' => false, 'message' => 'Upload error occurred'];
+    }
+    
+    // Validate file size
+    if ($file['size'] > $maxSize) {
+        return ['success' => false, 'message' => 'File too large (max ' . round($maxSize/1024/1024, 1) . 'MB)'];
+    }
+    
+    // Use getimagesize for validation (checks if it's really an image)
+    $imageInfo = @getimagesize($file['tmp_name']);
+    if ($imageInfo === false) {
+        return ['success' => false, 'message' => 'File is not a valid image'];
+    }
+    
+    // Check image type against whitelist
+    $imageType = $imageInfo[2];
+    if (!isset($allowedTypes[$imageType])) {
+        return ['success' => false, 'message' => 'Image type not allowed'];
+    }
+    
+    // Double-check MIME type with finfo
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mimeType = finfo_file($finfo, $file['tmp_name']);
+    finfo_close($finfo);
+    
+    $allowedMimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    if (!in_array($mimeType, $allowedMimes)) {
+        return ['success' => false, 'message' => 'Invalid MIME type'];
+    }
+    
+    // Check image dimensions (max 8000x8000)
+    if ($imageInfo[0] > 8000 || $imageInfo[1] > 8000) {
+        return ['success' => false, 'message' => 'Image dimensions too large'];
+    }
+    
+    // Generate safe filename (timestamp + random + extension)
+    $extension = $allowedTypes[$imageType];
+    $filename = date('Y-m-d_His') . '_' . bin2hex(random_bytes(8)) . '.' . $extension;
+    $targetPath = $uploadsDir . '/' . $filename;
+    
+    // Create uploads directory if it doesn't exist
+    if (!is_dir($uploadsDir)) {
+        mkdir($uploadsDir, 0755, true);
+    }
+    
+    // Move uploaded file
+    if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
+        return ['success' => false, 'message' => 'Failed to save file'];
+    }
+    
+    chmod($targetPath, 0644);
+    
+    return ['success' => true, 'filename' => $filename];
+}
+
+// Parse markdown
+    // Require Parsedown (add at top of file after declare)
 function parseMarkdown(string $text): string
 {
-    $text = htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
-    
-    // Code blocks
-    $text = preg_replace_callback('/``````/s', function ($m) {
-        return '<pre><code>' . $m[1] . '</code></pre>';
-    }, $text);
-    
-    // Inline code
-    $text = preg_replace_callback('/`([^`]+)`/', function($m) {
-        return '<code>' . $m[1] . '</code>';
-    }, $text);
-    
-  // Images with URL validation and optional alignment/sizing classes
-// Supports: ![alt](url){.center}, ![alt](url){.left .small}, etc.
-$text = preg_replace_callback('/!\[([^\]]*)\]\(([^)]+)\)(?:\{([^}]+)\})?/', function($m) {
-    $alt = $m[1];
-    $url = $m[2];
-    $modifiers = isset($m[3]) ? trim($m[3]) : '';
-    
-    // Parse modifiers (e.g., .center .small)
-    $classes = [];
-    if (!empty($modifiers)) {
-        preg_match_all('/\.(\w+)/', $modifiers, $matches);
-        foreach ($matches[1] as $class) {
-            $classes[] = 'img-' . $class;
-        }
-    }
-    
-    $classAttr = !empty($classes) ? ' class="' . implode(' ', $classes) . '"' : '';
-    $style = 'style="max-width:100%; max-height:400px;"';
-    
-    if (preg_match('/^https?:\/\//i', $url)) {
-        return '<img src="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" alt="' . htmlspecialchars($alt, ENT_QUOTES, 'UTF-8') . '"' . $classAttr . ' ' . $style . '>';
-    }
-    // Support local images in uploads directory
-    if (preg_match('/^uploads\//i', $url)) {
-        return '<img src="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" alt="' . htmlspecialchars($alt, ENT_QUOTES, 'UTF-8') . '"' . $classAttr . ' ' . $style . '>';
-    }
-    return htmlspecialchars($m[0], ENT_QUOTES, 'UTF-8');
-}, $text);
-
-    
-    // Headings
-    $text = preg_replace('/^###### (.*)$/m', '<h6>$1</h6>', $text);
-    $text = preg_replace('/^##### (.*)$/m', '<h5>$1</h5>', $text);
-    $text = preg_replace('/^#### (.*)$/m', '<h4>$1</h4>', $text);
-    $text = preg_replace('/^### (.*)$/m', '<h3>$1</h3>', $text);
-    $text = preg_replace('/^## (.*)$/m', '<h2>$1</h2>', $text);
-    $text = preg_replace('/^# (.*)$/m', '<h1>$1</h1>', $text);
-    
-    // Lists
-    $text = preg_replace('/^\s*[\-\*]\s+(.*)$/m', '<li>$1</li>', $text);
-    $text = preg_replace('/(<li>.*?<\/li>\s*)+/s', '<ul>$0</ul>', $text);
-    
-    // Bold and italic
-    $text = preg_replace('/\*\*\*(.+?)\*\*\*/', '<strong><em>$1</em></strong>', $text);
-    $text = preg_replace('/\*\*(.+?)\*\*/', '<strong>$1</strong>', $text);
-    $text = preg_replace('/\*(.+?)\*/', '<em>$1</em>', $text);
-    
-    // External links with validation
-    $text = preg_replace_callback('/\[([^\]]+)\]\(([^)]+)\)/', function($m) {
-        $linkText = $m[1];
-        $url = $m[2];
-        if (preg_match('/^https?:\/\//i', $url)) {
-            return '<a href="' . $url . '" class="ext" target="_blank" rel="noopener noreferrer">' . $linkText . '</a>';
-        }
-        return $m[0];
-    }, $text);
-    
-    // Internal links
-    $text = preg_replace_callback('/\[\[([^\]]+)\]\]/', function($m) {
-        $page = trim($m[1]);
-        $url = '?page=' . urlencode($page);
-        return '<a href="' . $url . '" class="int">' . $page . '</a>';
-    }, $text);
-    
-    // Tags
+    // Process hashtags BEFORE Parsedown
     $text = preg_replace_callback('/(^|\s)#([a-zA-Z0-9_\-]+)/', function($m) {
         return $m[1] . '<a href="?tag=' . urlencode($m[2]) . '" class="tag">#' . $m[2] . '</a>';
     }, $text);
     
-    // Line breaks
-    $lines = explode("\n", $text);
-    foreach ($lines as &$line) {
-        if (!preg_match('/^\s*<(h\d|ul|ol|li|pre|code|blockquote|p|table|tr|td|th)[ >]/', $line) && !empty(trim($line))) {
-            $line .= '<br>';
-        }
-    }
+    // Process wiki links
+    $text = preg_replace_callback('/\[\[([^\]]+)\]\]/', function($m) {
+        $page = trim($m[1]);
+        return '<a href="?page=' . urlencode($page) . '" class="int">' . htmlspecialchars($page, ENT_QUOTES, 'UTF-8') . '</a>';
+    }, $text);
     
-    return implode("\n", $lines);
+    // Process image modifiers BEFORE Parsedown (convert to data attribute)
+    $text = preg_replace_callback('/!\[([^\]]*)\]\(([^)]+)\)\{([^}]+)\}/', function($m) {
+        $alt = $m[1];
+        $url = $m[2];
+        $modifiers = $m[3];
+        // Convert to format Parsedown will pass through, then we'll post-process
+        return '![' . $alt . '](' . $url . ' "IMGMOD:' . $modifiers . '")';
+    }, $text);
+    
+    // Use Parsedown
+    $parsedown = new Parsedown();
+    $parsedown->setSafeMode(false);
+    $html = $parsedown->text($text);
+    
+    // Post-process: Apply image modifiers from title attribute
+    $html = preg_replace_callback('/<img([^>]+)title="IMGMOD:([^"]+)"([^>]*)>/', function($m) {
+        $before = $m[1];
+        $modifiers = $m[2];
+        $after = $m[3];
+        
+        // Extract classes from modifiers
+        $classes = [];
+        preg_match_all('/\.(\w+)/', $modifiers, $matches);
+        foreach ($matches[1] as $class) {
+            $classes[] = 'img-' . $class;
+        }
+        
+        $classAttr = !empty($classes) ? ' class="' . implode(' ', $classes) . '"' : '';
+        $style = ' style="max-width:100%; max-height:400px;"';
+        
+        // Rebuild img tag without the IMGMOD title
+        return '<img' . $before . $classAttr . $style . $after . '>';
+    }, $html);
+    
+    // Ensure regular images (without modifiers) have styling
+    $html = preg_replace_callback('/<img(?![^>]*style=)([^>]+)>/', function($m) {
+        return '<img' . $m[1] . ' style="max-width:100%; max-height:400px;">';
+    }, $html);
+    
+    return $html;
 }
+
+
+
 
 /**
  * Get list of all existing page names for auto-linking
@@ -132,9 +292,9 @@ function getAllPageNames(string $pagesDir): array
 
 /**
  * Automatically link page names found in text
- * @param string $text The text to process (before markdown parsing)
+ * @param string $text The text to process
  * @param string $pagesDir Pages directory
- * @param string $currentPage Current page (to avoid self-linking)
+ * @param string $currentPage Current page
  * @return string Text with automatic links added
  */
 function autoLinkPageNames(string $text, string $pagesDir, string $currentPage): string
@@ -151,7 +311,8 @@ function autoLinkPageNames(string $text, string $pagesDir, string $currentPage):
     
     foreach ($allPages as $page) {
         $escapedPage = preg_quote($page, '/');
-        $pattern = '/(?<!\[\[)(?<!\[)\b(' . $escapedPage . ')\b(?!\]\])(?!\])/i';
+        // UPDATED: Don't match if preceded by # (hashtag)
+        $pattern = '/(?<!\[\[)(?<!\[)(?<!\#)\b(' . $escapedPage . ')\b(?!\]\])(?!\])/i';
         
         $replaced = false;
         $text = preg_replace_callback($pattern, function($matches) use (&$replaced) {
@@ -166,10 +327,11 @@ function autoLinkPageNames(string $text, string $pagesDir, string $currentPage):
     return $text;
 }
 
+
 /**
  * Enhanced markdown parser with auto-linking
  * @param string $text Raw markdown content
- * @param string $pagesDir Pages directory for auto-linking
+ * @param string $pagesDir Pages directory
  * @param string $currentPage Current page name
  * @param bool $enableAutoLink Whether to enable automatic linking
  * @return string HTML output
@@ -184,7 +346,7 @@ function parseMarkdownWithAutoLink(string $text, string $pagesDir, string $curre
 }
 
 /**
- * Find all pages that link to the current page (backlinks)
+ * Find all pages that link to the current page
  * @param string $currentPage The page to find backlinks for
  * @param string $pagesDir Directory containing markdown files
  * @return array List of page names that link to current page
@@ -276,64 +438,19 @@ function getRelatedPagesByTags(string $currentPage, string $content, string $pag
 }
 
 /**
- * Handle image upload
- * @param array $file File from $_FILES
- * @param string $uploadsDir Directory for uploads
- * @return array Result with 'success' boolean and 'message' or 'filename'
+ * Generate a cryptographically secure nonce
+ * @return string Base64 encoded nonce
  */
-function handleImageUpload(array $file, string $uploadsDir): array
+function generateNonce(): string
 {
-    // Check for upload errors
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        return ['success' => false, 'message' => 'Upload error occurred'];
-    }
-    
-    // Validate file size (max 5MB)
-    if ($file['size'] > 5 * 1024 * 1024) {
-        return ['success' => false, 'message' => 'File too large (max 5MB)'];
-    }
-    
-    // Validate MIME type
-    $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    $finfo = finfo_open(FILEINFO_MIME_TYPE);
-    $mimeType = finfo_file($finfo, $file['tmp_name']);
-    finfo_close($finfo);
-    
-    if (!in_array($mimeType, $allowedTypes)) {
-        return ['success' => false, 'message' => 'Invalid file type. Only JPG, PNG, GIF, and WebP allowed'];
-    }
-    
-    // Generate safe filename
-    $extension = match($mimeType) {
-        'image/jpeg' => 'jpg',
-        'image/png' => 'png',
-        'image/gif' => 'gif',
-        'image/webp' => 'webp',
-        default => 'jpg'
-    };
-    
-    $filename = date('Y-m-d_His') . '_' . bin2hex(random_bytes(8)) . '.' . $extension;
-    $targetPath = $uploadsDir . '/' . $filename;
-    
-    // Create uploads directory if it doesn't exist
-    if (!is_dir($uploadsDir)) {
-        mkdir($uploadsDir, 0755, true);
-    }
-    
-    // Move uploaded file
-    if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
-        return ['success' => false, 'message' => 'Failed to save file'];
-    }
-    
-    chmod($targetPath, 0644);
-    
-    return ['success' => true, 'filename' => $filename];
+    return base64_encode(random_bytes(16));
 }
 
 /**
  * Render navigation bar
+ * @param string $nonce CSP nonce for inline scripts
  */
-function renderNav(): void
+function renderNav(string $nonce = ''): void
 {
     ?>
     <nav>
@@ -355,8 +472,9 @@ function renderNav(): void
  * Render complete HTML page
  * @param string $title Page title
  * @param callable $contentCallback Function that outputs page content
+ * @param string $nonce CSP nonce for inline scripts
  */
-function renderPage(string $title, callable $contentCallback): void
+function renderPage(string $title, callable $contentCallback, string $nonce = ''): void
 {
     ?>
 <!DOCTYPE html>
@@ -368,8 +486,9 @@ function renderPage(string $title, callable $contentCallback): void
     <link rel="stylesheet" type="text/css" href="styles.css">
 </head>
 <body>
-    <?php renderNav(); ?>
+    <?php renderNav($nonce); ?>
     <?php $contentCallback(); ?>
+    <script src="wiki.js" nonce="<?= $nonce ?>"></script>
 </body>
 </html>
     <?php

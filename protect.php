@@ -1,25 +1,26 @@
 <?php
+declare(strict_types=1);
+
 // Protection script - blocks direct access to sensitive files
 // Works on both Apache and Nginx
 
 $requestUri = $_SERVER['REQUEST_URI'] ?? '';
 
-// Block access to .json files
-if (preg_match('/\.json$/i', $requestUri)) {
-    http_response_code(403);
-    die('Access denied');
-}
+// Block access to sensitive files
+$blockedPatterns = [
+    '/\.json$/i',           // JSON files
+    '/\.(md|txt)$/i',       // Markdown and text files
+    '/\/(functions|protect|config)\.php$/i', // PHP includes
+    '/rate_limits\.json$/i', // Rate limit data
+    '/wiki\.log$/i'         // Log file
+];
 
-// Block access to .md and .txt files
-if (preg_match('/\.(md|txt)$/i', $requestUri)) {
-    http_response_code(403);
-    die('Access denied');
-}
-
-// Block access to functions.php and protect.php
-if (preg_match('/\/(functions|protect)\.php$/i', $requestUri)) {
-    http_response_code(403);
-    die('Access denied');
+foreach ($blockedPatterns as $pattern) {
+    if (preg_match($pattern, $requestUri)) {
+        http_response_code(403);
+        header('X-Robots-Tag: noindex');
+        die('Access denied');
+    }
 }
 
 // Only allow image files in uploads directory

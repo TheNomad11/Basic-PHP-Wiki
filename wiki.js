@@ -53,13 +53,13 @@ function uploadImage() {
     }
     
     uploadStatus.style.color = '#0066cc';
-    uploadStatus.textContent = 'â³ Uploading...';
+    uploadStatus.textContent = 'Uploading...';
     
     // Create FormData with image and CSRF token
     const formData = new FormData();
     const imageFile = document.getElementById('image-upload').files[0];
     formData.append('image', imageFile);
-    formData.append('csrf_token', document.querySelector('input[name="csrf_token"]').value);
+    formData.append('csrf', document.querySelector('input[name="csrf"]').value);
     formData.append('upload_only', '1');
     
     // Upload via AJAX

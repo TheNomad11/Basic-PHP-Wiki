@@ -53,7 +53,7 @@ function uploadImage() {
     }
     
     uploadStatus.style.color = '#0066cc';
-    uploadStatus.textContent = '⏳ Uploading...';
+    uploadStatus.textContent = 'â³ Uploading...';
     
     // Create FormData with image and CSRF token
     const formData = new FormData();
@@ -92,12 +92,12 @@ function uploadImage() {
             textarea.focus();
             
             // Show success message
-            uploadStatus.textContent = '✓ Image inserted!';
+            uploadStatus.textContent = 'âœ“ Image inserted!';
             uploadStatus.style.color = '#28a745';
             setTimeout(() => uploadStatus.remove(), 3000);
         } else {
             // Show error
-            uploadStatus.textContent = '✗ Upload failed';
+            uploadStatus.textContent = 'âœ— Upload failed';
             uploadStatus.style.color = '#dc3545';
         }
         
@@ -105,7 +105,7 @@ function uploadImage() {
         document.getElementById('image-upload').value = '';
     })
     .catch(error => {
-        uploadStatus.textContent = '✗ Upload error';
+        uploadStatus.textContent = 'âœ— Upload error';
         uploadStatus.style.color = '#dc3545';
         console.error('Upload error:', error);
     });

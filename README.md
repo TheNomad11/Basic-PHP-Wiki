@@ -24,11 +24,8 @@ A lightweight, secure, and easy-to-use flat-file wiki engine built with PHP. It 
 ## Installation
 
 1.  **Download Files**:
-    Clone this repository or download the source code to your web server.
-    ```
-    git clone https://github.com/your-username/your-repo-name.git
-    cd your-repo-name
-    ```
+
+    Download from [Releases](https://github.com/TheNomad11/Basic-PHP-Wiki/releases)
 
 2.  **Set Up Dependencies**:
     Download the `Parsedown.php` library and place it in the project's root directory.

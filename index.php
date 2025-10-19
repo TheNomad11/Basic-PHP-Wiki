@@ -1,36 +1,37 @@
 <?php
 declare(strict_types=1);
-// Load configuration
-$config = require_once __DIR__ . '/config.php';
+
+// Load configuration FIRST (use require, not require_once)
+$config = require __DIR__ . '/config.php';
 
 // Protection layer (works on Apache and Nginx)
 require_once __DIR__ . '/protect.php';
 
-// Include functions
+// Include functions (this starts the session already!)
 require_once __DIR__ . '/functions.php';
 
 // Generate CSP nonce for this request
 $nonce = generateNonce();
 
 // --- Security Headers ---
-header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$nonce'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none';");
-header("X-Frame-Options: DENY");
-header("X-Content-Type-Options: nosniff");
-header("Referrer-Policy: no-referrer-when-downgrade");
-header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
-header("X-XSS-Protection: 1; mode=block");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$nonce'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
+header('X-Frame-Options: DENY');
+header('X-Content-Type-Options: nosniff');
+header('Referrer-Policy: no-referrer-when-downgrade');
+header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
+header('X-XSS-Protection: 1; mode=block');
 
 // Add these cache control headers
-header("Cache-Control: no-cache, no-store, must-revalidate");
-header("Pragma: no-cache");
-header("Expires: 0");
+header('Cache-Control: no-cache, no-store, must-revalidate');
+header('Pragma: no-cache');
+header('Expires: 0');
 
 // Force HTTPS in production
 if (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') {
-    header("Strict-Transport-Security: max-age=31536000; includeSubDomains; preload");
+    header('Strict-Transport-Security: max-age=31536000; includeSubDomains; preload');
 }
 
-// Extract config
+// Extract config values
 $pagesDir = $config['pages_dir'];
 $uploadsDir = $config['uploads_dir'];
 $sessionPath = $config['sessions_dir'];
@@ -40,65 +41,33 @@ $logFile = $config['log_file'];
 $defaultPage = $config['default_page'];
 $enableAutoLink = $config['enable_auto_link'];
 
-// Ensure directories exist with proper permissions
+// Ensure directories exist
 if (!is_dir($pagesDir)) {
-    mkdir($pagesDir, 0750, true);
-}
-
-if (!is_dir($uploadsDir)) {
-    mkdir($uploadsDir, 0755, true);
-}
-
-if (!is_dir($sessionPath)) {
-    mkdir($sessionPath, 0700, true);
-}
-
-// Create index.php in protected directories to block directory listing
-foreach ([$pagesDir, $uploadsDir] as $dir) {
-    $indexFile = $dir . '/index.php';
+    @mkdir($pagesDir, 0755, true);
+    $indexFile = $pagesDir . '/Home.md';
     if (!file_exists($indexFile)) {
-        file_put_contents($indexFile, '<?php http_response_code(403); die("Access denied"); ?>');
+        file_put_contents($indexFile, "# Welcome to Simple Wiki\n\nEdit this page to get started.");
         chmod($indexFile, 0644);
     }
 }
 
-// --- Session Security ---
-ini_set('session.cookie_httponly', '1');
-ini_set('session.use_only_cookies', '1');
-ini_set('session.use_strict_mode', '1');
+// NO SESSION START HERE - functions.php already did it!
+// Session is already active from functions.php
 
-// Automatically detect directory for session path isolation
-$scriptPath = dirname($_SERVER['SCRIPT_NAME']);
-if ($scriptPath === '/') {
-    $scriptPath = '/';
-} else {
-    $scriptPath = rtrim($scriptPath, '/') . '/';
-}
-
-session_set_cookie_params([
-    'lifetime' => $config['session_lifetime'],
-    'path' => $scriptPath,
-    'secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on',
-    'httponly' => true,
-    'samesite' => 'Strict'
-]);
-
-session_save_path($sessionPath);
-session_start();
-
-// Regenerate session ID to prevent session fixation
+// Regenerate session ID on first visit to prevent session fixation
 if (!isset($_SESSION['init'])) {
     session_regenerate_id(true);
     $_SESSION['init'] = true;
     $_SESSION['created'] = time();
 }
 
-// Session timeout (1 hour absolute)
+// Session timeout (absolute timeout)
 if (isset($_SESSION['created']) && (time() - $_SESSION['created'] > $config['session_lifetime'])) {
     session_unset();
     session_destroy();
     clearSessionCookie();
-    session_start();
+    header("Location: index.php");
+    exit;
 }
 
 // Load users
@@ -107,15 +76,11 @@ if (!is_array($users)) {
     $users = [];
 }
 
-// --- CSRF Token Generation ---
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
-
 // --- Handle login with IP-based rate limiting ---
 $error = '';
 if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['password'])) {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+    // Simple CSRF check
+    if (!isset($_POST['csrf']) || $_POST['csrf'] !== ($_SESSION['csrf_token'] ?? '')) {
         logMessage('CSRF token mismatch on login', 'WARNING', $logFile);
         die("Security error: Invalid request");
     }
@@ -151,7 +116,8 @@ if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['passw
 }
 
 // --- Handle logout with proper cookie clearing ---
-if (isset($_GET['logout'])) {
+// FIX #1: Now handles both GET and POST logout requests
+if (isset($_GET['logout']) || isset($_POST['logout'])) {
     $username = $_SESSION['user'] ?? 'unknown';
     $clientIp = getClientIp();
     logMessage("User logout: $username from IP: $clientIp", 'INFO', $logFile);
@@ -163,7 +129,6 @@ if (isset($_GET['logout'])) {
     header("Location: index.php");
     exit;
 }
-
 
 // --- Activity timeout check ---
 if (isset($_SESSION['loggedin']) && isset($_SESSION['last_activity'])) {
@@ -177,12 +142,11 @@ if (isset($_SESSION['loggedin']) && isset($_SESSION['last_activity'])) {
     $_SESSION['last_activity'] = time();
 }
 
-// ADD THIS SECTION HERE - Simple login requirement
+// Simple login requirement
+// FIX #2: Removed nested condition - always show login form if not authenticated
 if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
     // User is not logged in - show login form
-    if (!isset($_POST['login'])) {
-        // Not attempting to login, show the form
-        ?>
+    ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -198,21 +162,16 @@ if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
         <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
     <?php endif; ?>
     <form method="post">
-        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+        <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
         <label>Username: <input type="text" name="username" required maxlength="30" pattern="[a-zA-Z0-9_\-]{3,30}" autocomplete="username" autofocus></label><br>
         <label>Password: <input type="password" name="password" required autocomplete="current-password"></label><br>
         <button type="submit" name="login">Login</button>
     </form>
 </body>
 </html>
-        <?php
-        exit;
-    }
-    // If $_POST['login'] is set, let the code continue to process the login above
+    <?php
+    exit;
 }
-
-
-
 
 // --- Determine current page ---
 $page = $_GET['page'] ?? $defaultPage;
@@ -338,44 +297,14 @@ if ($content === false) {
 
 $isEditing = isset($_GET['edit']) && ($_SESSION['loggedin'] ?? false);
 
-// --- Handle image upload with enhanced validation ---
-$uploadMessage = '';
-if (isset($_FILES['image']) && $_FILES['image']['error'] !== UPLOAD_ERR_NO_FILE) {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
-        logMessage("CSRF token mismatch on image upload", 'WARNING', $logFile);
-        die("Security error: Invalid request");
-    }
-    
-    $result = handleImageUpload(
-        $_FILES['image'], 
-        $uploadsDir, 
-        $config['allowed_image_types'],
-        $config['max_upload_size']
-    );
-    
-    if ($result['success']) {
-        $uploadMessage = 'uploads/' . $result['filename'];
-        $username = $_SESSION['user'] ?? 'unknown';
-        logMessage("Image uploaded: {$result['filename']} by user: $username", 'INFO', $logFile);
-        
-        // If this is an AJAX upload, return minimal HTML
-        if (isset($_POST['upload_only'])) {
-            echo '<div class="upload-success" data-markdown="![Image description](' . htmlspecialchars($uploadMessage, ENT_QUOTES, 'UTF-8') . ')"></div>';
-            exit;
-        }
-    } else {
-        $error = $result['message'];
-        logMessage("Image upload failed: {$result['message']}", 'WARNING', $logFile);
-    }
-}
-
-// --- Save edits ---
-if ($isEditing && isset($_POST['content']) && !isset($_POST['upload_only'])) {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+// --- Save edits FIRST (before any output/error handling) ---
+if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
+    // Simple CSRF check
+    if (!isset($_POST['csrf']) || $_POST['csrf'] !== ($_SESSION['csrf_token'] ?? '')) {
         logMessage("CSRF token mismatch on save", 'WARNING', $logFile);
         die("Security error: Invalid request");
     }
-    
+
     if (strlen($_POST['content']) > $config['max_content_size']) {
         die("Content too large (max " . round($config['max_content_size']/1024) . "KB)");
     }
@@ -407,6 +336,36 @@ if ($isEditing && isset($_POST['content']) && !isset($_POST['upload_only'])) {
     
     header("Location: index.php?page=" . urlencode($pageSafe));
     exit;
+}
+
+// --- Handle image upload ---
+$uploadMessage = '';
+if (isset($_FILES['image']['tmp_name']) && is_uploaded_file($_FILES['image']['tmp_name'])) {
+    // Simple CSRF check
+    if (!isset($_POST['csrf']) || $_POST['csrf'] !== ($_SESSION['csrf_token'] ?? '')) {
+        logMessage("CSRF token mismatch on image upload", 'WARNING', $logFile);
+        die("Security error: Invalid request");
+    }
+
+    $result = handleImageUpload(
+        $_FILES['image'], 
+        $uploadsDir, 
+        $config['max_upload_size']
+    );
+    
+    if ($result['success']) {
+        $uploadMessage = 'uploads/' . $result['filename'];
+        $username = $_SESSION['user'] ?? 'unknown';
+        logMessage("Image uploaded: {$result['filename']} by user: $username", 'INFO', $logFile);
+        
+        if (isset($_POST['upload_only'])) {
+            echo '<div class="upload-success" data-markdown="![Image description](' . htmlspecialchars($uploadMessage, ENT_QUOTES, 'UTF-8') . ')"></div>';
+            exit;
+        }
+    } else {
+        $error = $result['message'];
+        logMessage("Image upload failed: {$result['message']}", 'WARNING', $logFile);
+    }
 }
 
 // --- Handle search ---
@@ -471,7 +430,7 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
     <?php elseif ($isEditing): ?>
         <h2>Editing: <?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></h2>
         <form method="post" enctype="multipart/form-data" id="editForm">
-            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
             <div id="toolbar">
                 <button type="button" id="btn-bold"><b>B</b></button>
                 <button type="button" id="btn-italic"><i>I</i></button>
@@ -486,11 +445,9 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
             <button type="submit" name="save">Save</button>
             <a href="?page=<?= urlencode($page) ?>"><button type="button">Cancel</button></a>
         </form>
-        
-   
     <?php else: ?>
         <h1><?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></h1>
-         <div><?= parseMarkdownWithAutoLink($content, $pagesDir, $page, $enableAutoLink) ?></div>
+        <div><?= parseMarkdownWithAutoLink($content, $pagesDir, $page, $enableAutoLink) ?></div>
         
         <div style="clear: both;"></div>
         
@@ -499,7 +456,6 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
         <?php endif; ?>
        
         <?php
-        // Display backlinks and related pages
         if (!empty($content)) {
             $backlinks = getBacklinks($page, $pagesDir);
             $relatedPages = getRelatedPagesByTags($page, $content, $pagesDir);

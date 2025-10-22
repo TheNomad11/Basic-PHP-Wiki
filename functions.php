@@ -4,7 +4,6 @@ declare(strict_types=1);
 // Load configuration
 $config = require __DIR__ . '/config.php';
 
-
 // Define constants from config
 define('PAGES_DIR', $config['pages_dir']);
 define('UPLOADS_DIR', $config['uploads_dir']);

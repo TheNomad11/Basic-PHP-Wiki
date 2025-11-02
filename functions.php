@@ -22,6 +22,9 @@ define('MAX_IMAGE_HEIGHT', 8000);
 define('MAX_PAGE_NAME_LENGTH', 100);
 define('MAX_SEARCH_LENGTH', 100);
 define('MAX_TAG_LENGTH', 50);
+define('CACHE_DIR', $config['cache_dir'] ?? __DIR__ . '/cache');
+define('SEARCH_INDEX_FILE', CACHE_DIR . '/search_index.json');
+define('PAGES_PER_PAGE', 50);
 
 // Require Parsedown
 require_once 'Parsedown.php';
@@ -529,6 +532,200 @@ function parseMarkdownWithAutoLink(string $text, string $pagesDir = PAGES_DIR, s
 }
 
 // -----------------------------
+// Caching functions
+// -----------------------------
+/**
+ * Get cached parsed HTML for a page
+ * 
+ * @param string $pageName Page name
+ * @param string $content Raw markdown content
+ * @return string|null Cached HTML or null if not cached or outdated
+ */
+function getCachedHtml(string $pageName, string $content): ?string
+{
+    $cacheDir = CACHE_DIR;
+    if (!is_dir($cacheDir)) {
+        if (!mkdir($cacheDir, 0750, true) && !is_dir($cacheDir)) {
+            return null;
+        }
+    }
+    
+    $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
+    $hashFile = $cacheFile . '.hash';
+    
+    if (!file_exists($cacheFile) || !file_exists($hashFile)) {
+        return null;
+    }
+    
+    // Check if content has changed
+    $currentHash = md5($content);
+    $cachedHash = file_get_contents($hashFile);
+    
+    if ($currentHash !== $cachedHash) {
+        return null;
+    }
+    
+    return file_get_contents($cacheFile);
+}
+
+/**
+ * Save parsed HTML to cache
+ * 
+ * @param string $pageName Page name
+ * @param string $content Raw markdown content
+ * @param string $html Parsed HTML
+ * @return bool Success status
+ */
+function setCachedHtml(string $pageName, string $content, string $html): bool
+{
+    $cacheDir = CACHE_DIR;
+    if (!is_dir($cacheDir)) {
+        if (!mkdir($cacheDir, 0750, true) && !is_dir($cacheDir)) {
+            return false;
+        }
+    }
+    
+    $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
+    $hashFile = $cacheFile . '.hash';
+    
+    $contentHash = md5($content);
+    
+    $result1 = file_put_contents($cacheFile, $html, LOCK_EX);
+    $result2 = file_put_contents($hashFile, $contentHash, LOCK_EX);
+    
+    if ($result1 !== false && $result2 !== false) {
+        chmod($cacheFile, 0644);
+        chmod($hashFile, 0644);
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Clear cache for a specific page
+ * 
+ * @param string $pageName Page name
+ */
+function clearPageCache(string $pageName): void
+{
+    $cacheDir = CACHE_DIR;
+    $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
+    $hashFile = $cacheFile . '.hash';
+    
+    if (file_exists($cacheFile)) {
+        unlink($cacheFile);
+    }
+    if (file_exists($hashFile)) {
+        unlink($hashFile);
+    }
+}
+
+// -----------------------------
+// Search index functions
+// -----------------------------
+/**
+ * Build search index for all pages
+ * 
+ * @param string $pagesDir Pages directory
+ * @return bool Success status
+ */
+function buildSearchIndex(string $pagesDir = PAGES_DIR): bool
+{
+    $index = [];
+    $files = glob($pagesDir . '/*.md');
+    
+    if ($files === false) {
+        return false;
+    }
+    
+    foreach ($files as $file) {
+        $pageName = basename($file, '.md');
+        $content = file_get_contents($file);
+        
+        if ($content === false) {
+            continue;
+        }
+        
+        // Remove markdown syntax for better search
+        $searchableContent = strip_tags(parseMarkdown($content));
+        $searchableContent = strtolower($searchableContent);
+        
+        $index[$pageName] = [
+            'name' => $pageName,
+            'content' => $searchableContent,
+            'length' => strlen($content),
+            'mtime' => filemtime($file)
+        ];
+    }
+    
+    return writeJsonFileLocked(SEARCH_INDEX_FILE, $index);
+}
+
+/**
+ * Get search index, rebuilding if necessary
+ * 
+ * @param string $pagesDir Pages directory
+ * @return array Search index
+ */
+function getSearchIndex(string $pagesDir = PAGES_DIR): array
+{
+    $indexFile = SEARCH_INDEX_FILE;
+    
+    // Check if index exists and is recent (less than 1 hour old)
+    if (file_exists($indexFile)) {
+        $indexAge = time() - filemtime($indexFile);
+        if ($indexAge < 3600) {
+            return readJsonFileLocked($indexFile);
+        }
+    }
+    
+    // Rebuild index
+    buildSearchIndex($pagesDir);
+    return readJsonFileLocked($indexFile);
+}
+
+/**
+ * Search using the index
+ * 
+ * @param string $query Search query
+ * @param string $pagesDir Pages directory
+ * @return array Array of [pageName => snippet]
+ */
+function searchWithIndex(string $query, string $pagesDir = PAGES_DIR): array
+{
+    $index = getSearchIndex($pagesDir);
+    $results = [];
+    $queryLower = strtolower($query);
+    
+    foreach ($index as $pageName => $data) {
+        // Search in page name
+        if (stripos($data['name'], $query) !== false) {
+            $results[$pageName] = '<mark>' . htmlspecialchars($data['name'], ENT_QUOTES, 'UTF-8') . '</mark> (name match)';
+            continue;
+        }
+        
+        // Search in content
+        if (stripos($data['content'], $queryLower) !== false) {
+            $pos = stripos($data['content'], $queryLower);
+            $start = max(0, $pos - 60);
+            $length = min(120, strlen($data['content']) - $start);
+            $snippet = substr($data['content'], $start, $length);
+            
+            $snippet = preg_replace(
+                '/(' . preg_quote($query, '/') . ')/i',
+                '<mark>$1</mark>',
+                htmlspecialchars($snippet, ENT_QUOTES, 'UTF-8')
+            );
+            
+            $results[$pageName] = $snippet;
+        }
+    }
+    
+    return $results;
+}
+
+// -----------------------------
 // Backlinks & related pages
 // -----------------------------
 function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR): array
@@ -563,11 +760,39 @@ function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR): array
 
 function getRelatedPagesByTags(string $currentPage, string $content, string $pagesDir = PAGES_DIR, int $limit = 5): array
 {
-    $contentWithoutCode = preg_replace('/```.*?```/s', '', $content);
+    // Split into lines for better processing
+    $lines = explode("\n", $content);
+    $cleanedLines = [];
+    
+    foreach ($lines as $line) {
+        // Skip lines that start with # (markdown headings)
+        if (preg_match('/^\s*#{1,6}\s/', $line)) {
+            continue;
+        }
+        
+        // Skip code blocks
+        if (preg_match('/^\s*```/', $line)) {
+            continue;
+        }
+        
+        // Skip indented code blocks
+        if (preg_match('/^\s{4,}/', $line)) {
+            continue;
+        }
+        
+        $cleanedLines[] = $line;
+    }
+    
+    $contentWithoutCode = implode("\n", $cleanedLines);
+    
+    // Remove inline code
     $contentWithoutCode = preg_replace('/`[^`]+`/', '', $contentWithoutCode);
-    $contentWithoutCode = preg_replace('/^[ ]{4,}.*/m', '', $contentWithoutCode);
+    
+    // Remove markdown links [text](url)
+    $contentWithoutCode = preg_replace('/\[([^\]]+)\]\([^\)]+\)/', '$1', $contentWithoutCode);
 
-    preg_match_all('/#([a-zA-Z0-9_\-]+)/', $contentWithoutCode, $m);
+    // Extract tags
+    preg_match_all('/(?:^|\s)#([a-zA-Z0-9_\-]+)(?:\s|$)/m', $contentWithoutCode, $m);
     $currentTags = $m[1] ?? [];
     if (empty($currentTags)) {
         return [];
@@ -590,7 +815,28 @@ function getRelatedPagesByTags(string $currentPage, string $content, string $pag
             continue;
         }
         
-        preg_match_all('/#([a-zA-Z0-9_\-]+)/', $otherContent, $om);
+        // Same cleanup for other pages
+        $otherLines = explode("\n", $otherContent);
+        $otherCleanedLines = [];
+        
+        foreach ($otherLines as $line) {
+            if (preg_match('/^\s*#{1,6}\s/', $line)) {
+                continue;
+            }
+            if (preg_match('/^\s*```/', $line)) {
+                continue;
+            }
+            if (preg_match('/^\s{4,}/', $line)) {
+                continue;
+            }
+            $otherCleanedLines[] = $line;
+        }
+        
+        $otherContent = implode("\n", $otherCleanedLines);
+        $otherContent = preg_replace('/`[^`]+`/', '', $otherContent);
+        $otherContent = preg_replace('/\[([^\]]+)\]\([^\)]+\)/', '$1', $otherContent);
+        
+        preg_match_all('/(?:^|\s)#([a-zA-Z0-9_\-]+)(?:\s|$)/m', $otherContent, $om);
         $otherTags = $om[1] ?? [];
         $shared = array_intersect($currentTags, $otherTags);
         
@@ -643,6 +889,7 @@ function renderNav(string $nonce = ''): void
         <a href="index.php">Home</a>
         <a href="?page=AllPages">All Pages</a>
         <a href="?page=AllTags">All Tags</a>
+        <a href="?page=RecentChanges">Recent Changes</a>
         <?php if ($loggedIn): ?>
             <form method="post" style="display:inline;">
                 <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>">
@@ -702,4 +949,85 @@ function validateUserPasswords(string $usersFile = USERS_FILE): array
     }
     
     return $invalid;
+}
+
+/**
+ * Get recent changes with metadata
+ * 
+ * @param string $pagesDir Pages directory
+ * @param int $limit Maximum number of changes to return
+ * @return array Array of changes with page name, timestamp, and user
+ */
+function getRecentChanges(string $pagesDir = PAGES_DIR, int $limit = 50): array
+{
+    if (!is_dir($pagesDir)) {
+        return [];
+    }
+    
+    $changes = [];
+    $files = glob($pagesDir . '/*.md');
+    
+    if ($files === false) {
+        return [];
+    }
+    
+    foreach ($files as $file) {
+        $pageName = basename($file, '.md');
+        $mtime = filemtime($file);
+        
+        if ($mtime === false) {
+            continue;
+        }
+        
+        // Try to get metadata from companion file
+        $metaFile = $file . '.meta';
+        $user = 'unknown';
+        
+        if (file_exists($metaFile)) {
+            $meta = json_decode(file_get_contents($metaFile), true);
+            if (is_array($meta) && isset($meta['user'])) {
+                $user = $meta['user'];
+            }
+        }
+        
+        $changes[] = [
+            'page' => $pageName,
+            'timestamp' => $mtime,
+            'user' => $user,
+            'date' => date('Y-m-d H:i:s', $mtime)
+        ];
+    }
+    
+    // Sort by timestamp descending (newest first)
+    usort($changes, function($a, $b) {
+        return $b['timestamp'] - $a['timestamp'];
+    });
+    
+    return array_slice($changes, 0, $limit);
+}
+
+/**
+ * Save page metadata (user, timestamp)
+ * 
+ * @param string $pagePath Full path to the page file
+ * @param string $user Username who made the edit
+ * @return bool Success status
+ */
+function savePageMetadata(string $pagePath, string $user): bool
+{
+    $metaFile = $pagePath . '.meta';
+    $metadata = [
+        'user' => $user,
+        'timestamp' => time(),
+        'date' => date('Y-m-d H:i:s')
+    ];
+    
+    $result = file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX);
+    
+    if ($result !== false) {
+        chmod($metaFile, 0644);
+        return true;
+    }
+    
+    return false;
 }

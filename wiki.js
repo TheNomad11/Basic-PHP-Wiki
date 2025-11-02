@@ -1,13 +1,31 @@
-// wiki.js - External JavaScript file for the wiki
+// wiki.js - External JavaScript file for the wiki with auto-save
+
+// Auto-save functionality
+let autoSaveTimer = null;
+let lastSavedContent = '';
+let saveInProgress = false;
+
+// Test localStorage availability immediately
+try {
+    const test = 'test';
+    localStorage.setItem('test', test);
+    localStorage.removeItem('test');
+    console.log('localStorage is available');
+} catch (e) {
+    console.error('localStorage is NOT available:', e);
+}
 
 // Wait for DOM to be ready
 document.addEventListener('DOMContentLoaded', function() {
+    console.log('Wiki.js loaded'); // Debug log
+    
     // Attach event listeners to toolbar buttons
     const btnBold = document.getElementById('btn-bold');
     const btnItalic = document.getElementById('btn-italic');
     const btnLink = document.getElementById('btn-link');
     const btnHelp = document.getElementById('btn-help');
     const imageUpload = document.getElementById('image-upload');
+    const editbox = document.getElementById('editbox');
     
     if (btnBold) {
         btnBold.addEventListener('click', function() {
@@ -38,10 +56,274 @@ document.addEventListener('DOMContentLoaded', function() {
             uploadImage();
         });
     }
+    
+    // Initialize auto-save if we're in edit mode
+    if (editbox) {
+        console.log('Edit box found, initializing auto-save'); // Debug log
+        initAutoSave();
+    } else {
+        console.log('No edit box found'); // Debug log
+    }
 });
 
+// Initialize auto-save functionality
+function initAutoSave() {
+    const editbox = document.getElementById('editbox');
+    if (!editbox) {
+        console.log('Cannot initialize auto-save: editbox not found');
+        return;
+    }
+    
+    console.log('Auto-save initialized'); // Debug log
+    
+    // Store initial content
+    lastSavedContent = editbox.value;
+    
+    // Load any draft from localStorage
+    const pageName = getPageName();
+    const draftKey = 'wiki_draft_' + pageName;
+    
+    console.log('Checking for draft with key:', draftKey); // Debug log
+    
+    try {
+        const savedDraft = localStorage.getItem(draftKey);
+        const draftTimestamp = localStorage.getItem(draftKey + '_time');
+        
+        console.log('Saved draft:', savedDraft ? 'Found' : 'Not found'); // Debug log
+        
+        if (savedDraft && savedDraft !== lastSavedContent) {
+            const draftDate = draftTimestamp ? new Date(parseInt(draftTimestamp)) : null;
+            const timeAgo = draftDate ? formatTimeAgo(draftDate) : 'earlier';
+            
+            // Check if the draft is very recent (within last 5 seconds)
+            // This prevents asking about drafts that were just saved during navigation
+            const isVeryRecent = draftDate && (Date.now() - draftDate.getTime()) < 5000;
+            
+            if (!isVeryRecent && confirm(`A draft was saved ${timeAgo}. Would you like to restore it?`)) {
+                editbox.value = savedDraft;
+                lastSavedContent = savedDraft;
+                showStatus('Draft restored', 'success');
+            } else {
+                // Clear the draft if user declined or if it's too recent
+                localStorage.removeItem(draftKey);
+                localStorage.removeItem(draftKey + '_time');
+            }
+        }
+    } catch (e) {
+        console.error('Error loading draft:', e);
+    }
+    
+    // Add status indicator
+    addStatusIndicator();
+    
+    // Listen for changes
+    editbox.addEventListener('input', function() {
+        console.log('Input event triggered'); // Debug log
+        
+        // Clear existing timer
+        if (autoSaveTimer) {
+            clearTimeout(autoSaveTimer);
+        }
+        
+        // Show "unsaved" status
+        updateStatus('unsaved');
+        
+        // Set new timer (save after 2 seconds of inactivity)
+        autoSaveTimer = setTimeout(function() {
+            saveDraft();
+        }, 2000);
+    });
+    
+    // Update the display every minute to show relative time
+    setInterval(function() {
+        const pageName = getPageName();
+        const draftKey = 'wiki_draft_' + pageName;
+        const draftTimestamp = localStorage.getItem(draftKey + '_time');
+        
+        if (draftTimestamp) {
+            const saveTime = new Date(parseInt(draftTimestamp));
+            const timeStr = saveTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const statusDiv = document.getElementById('save-status');
+            if (statusDiv && statusDiv.textContent.includes('Draft saved')) {
+                statusDiv.textContent = '✓ Draft saved at ' + timeStr;
+            }
+        }
+    }, 60000); // Update every minute
+    
+    // Save on page unload
+    window.addEventListener('beforeunload', function(e) {
+        const editbox = document.getElementById('editbox');
+        if (editbox && editbox.value !== lastSavedContent && !saveInProgress) {
+            saveDraft(true); // Synchronous save
+            // Note: Modern browsers may ignore custom messages
+            e.preventDefault();
+            e.returnValue = 'You have unsaved changes. Are you sure you want to leave?';
+            return e.returnValue;
+        }
+    });
+    
+    // Intercept form submission to clear draft
+    const editForm = document.getElementById('editForm');
+    if (editForm) {
+        editForm.addEventListener('submit', function(e) {
+            console.log('Form submitted, clearing draft'); // Debug log
+            saveInProgress = true; // Set flag to prevent beforeunload from saving
+            const pageName = getPageName();
+            const draftKey = 'wiki_draft_' + pageName;
+            try {
+                localStorage.removeItem(draftKey);
+                localStorage.removeItem(draftKey + '_time');
+            } catch (e) {
+                console.error('Error clearing draft:', e);
+            }
+        });
+    }
+}
+
+// Add status indicator to the page
+function addStatusIndicator() {
+    const toolbar = document.getElementById('toolbar');
+    if (!toolbar) {
+        console.log('Cannot add status indicator: toolbar not found');
+        return;
+    }
+    
+    // Check if already exists
+    if (document.getElementById('save-status')) {
+        return;
+    }
+    
+    const statusDiv = document.createElement('div');
+    statusDiv.id = 'save-status';
+    statusDiv.style.cssText = 'display: inline-block; margin-left: 1em; padding: 0.4em 0.8em; border-radius: 4px; font-size: 0.9em;';
+    toolbar.appendChild(statusDiv);
+    
+    updateStatus('saved');
+}
+
+// Update status indicator
+function updateStatus(status, timestamp = null) {
+    const statusDiv = document.getElementById('save-status');
+    if (!statusDiv) return;
+    
+    const now = new Date();
+    const timeStr = timestamp || now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    
+    switch(status) {
+        case 'saved':
+            statusDiv.textContent = '✓ Draft saved at ' + timeStr;
+            statusDiv.style.backgroundColor = '#d4edda';
+            statusDiv.style.color = '#155724';
+            break;
+        case 'unsaved':
+            statusDiv.textContent = '● Unsaved changes';
+            statusDiv.style.backgroundColor = '#fff3cd';
+            statusDiv.style.color = '#856404';
+            break;
+        case 'saving':
+            statusDiv.textContent = '⟳ Saving draft...';
+            statusDiv.style.backgroundColor = '#d1ecf1';
+            statusDiv.style.color = '#0c5460';
+            break;
+        case 'error':
+            statusDiv.textContent = '✗ Save failed';
+            statusDiv.style.backgroundColor = '#f8d7da';
+            statusDiv.style.color = '#721c24';
+            break;
+    }
+}
+
+// Show temporary status message
+function showStatus(message, type) {
+    const statusDiv = document.getElementById('save-status');
+    if (!statusDiv) return;
+    
+    const originalContent = statusDiv.textContent;
+    const originalBg = statusDiv.style.backgroundColor;
+    const originalColor = statusDiv.style.color;
+    
+    switch(type) {
+        case 'success':
+            statusDiv.style.backgroundColor = '#d4edda';
+            statusDiv.style.color = '#155724';
+            break;
+        case 'error':
+            statusDiv.style.backgroundColor = '#f8d7da';
+            statusDiv.style.color = '#721c24';
+            break;
+    }
+    
+    statusDiv.textContent = message;
+    
+    setTimeout(function() {
+        statusDiv.textContent = originalContent;
+        statusDiv.style.backgroundColor = originalBg;
+        statusDiv.style.color = originalColor;
+    }, 3000);
+}
+
+// Save draft to localStorage
+function saveDraft(synchronous = false) {
+    const editbox = document.getElementById('editbox');
+    if (!editbox) return;
+    
+    const content = editbox.value;
+    
+    // Don't save if content hasn't changed
+    if (content === lastSavedContent) {
+        console.log('Content unchanged, skipping save');
+        return;
+    }
+    
+    console.log('Saving draft...'); // Debug log
+    updateStatus('saving');
+    
+    try {
+        const pageName = getPageName();
+        const draftKey = 'wiki_draft_' + pageName;
+        const now = Date.now();
+        
+        localStorage.setItem(draftKey, content);
+        localStorage.setItem(draftKey + '_time', now.toString());
+        
+        lastSavedContent = content;
+        
+        // Show time of save
+        const saveTime = new Date(now);
+        const timeStr = saveTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        updateStatus('saved', timeStr);
+        console.log('Draft saved successfully at', timeStr); // Debug log
+    } catch (e) {
+        console.error('Failed to save draft:', e);
+        updateStatus('error');
+        
+        // Check if it's a quota exceeded error
+        if (e.name === 'QuotaExceededError') {
+            alert('Storage quota exceeded. Please clear some old drafts or reduce content size.');
+        }
+    }
+}
+
+// Get current page name from URL
+function getPageName() {
+    const params = new URLSearchParams(window.location.search);
+    const pageName = params.get('page') || 'Home';
+    console.log('Current page name:', pageName); // Debug log
+    return pageName;
+}
+
+// Format time ago
+function formatTimeAgo(date) {
+    const seconds = Math.floor((new Date() - date) / 1000);
+    
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return Math.floor(seconds / 60) + ' minutes ago';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + ' hours ago';
+    return Math.floor(seconds / 86400) + ' days ago';
+}
+
+// Image upload function
 function uploadImage() {
-    // Show uploading message
     const toolbar = document.getElementById('toolbar');
     let uploadStatus = document.getElementById('upload-status');
     
@@ -55,21 +337,18 @@ function uploadImage() {
     uploadStatus.style.color = '#0066cc';
     uploadStatus.textContent = 'Uploading...';
     
-    // Create FormData with image and CSRF token
     const formData = new FormData();
     const imageFile = document.getElementById('image-upload').files[0];
     formData.append('image', imageFile);
     formData.append('csrf', document.querySelector('input[name="csrf"]').value);
     formData.append('upload_only', '1');
     
-    // Upload via AJAX
     fetch(window.location.href, {
         method: 'POST',
         body: formData
     })
     .then(response => response.text())
     .then(html => {
-        // Parse response to get upload message
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
         const uploadDiv = doc.querySelector('.upload-success');
@@ -77,7 +356,6 @@ function uploadImage() {
         if (uploadDiv) {
             const markdownCode = uploadDiv.getAttribute('data-markdown');
             
-            // Insert at cursor position
             const textarea = document.getElementById('editbox');
             const start = textarea.selectionStart;
             const end = textarea.selectionEnd;
@@ -85,32 +363,32 @@ function uploadImage() {
             const after = textarea.value.substring(end);
             textarea.value = before + markdownCode + after;
             
-            // Update cursor position
             const newPos = start + markdownCode.length;
             textarea.selectionStart = newPos;
             textarea.selectionEnd = newPos;
             textarea.focus();
             
-            // Show success message
-            uploadStatus.textContent = 'âœ“ Image inserted!';
+            // Trigger auto-save
+            textarea.dispatchEvent(new Event('input'));
+            
+            uploadStatus.textContent = '✓ Image inserted!';
             uploadStatus.style.color = '#28a745';
             setTimeout(() => uploadStatus.remove(), 3000);
         } else {
-            // Show error
-            uploadStatus.textContent = 'âœ— Upload failed';
+            uploadStatus.textContent = '✗ Upload failed';
             uploadStatus.style.color = '#dc3545';
         }
         
-        // Reset file input
         document.getElementById('image-upload').value = '';
     })
     .catch(error => {
-        uploadStatus.textContent = 'âœ— Upload error';
+        uploadStatus.textContent = '✗ Upload error';
         uploadStatus.style.color = '#dc3545';
         console.error('Upload error:', error);
     });
 }
 
+// Format text with markdown
 function formatText(startTag, endTag) {
     const textarea = document.getElementById("editbox");
     if (!textarea) return;
@@ -122,14 +400,19 @@ function formatText(startTag, endTag) {
     const after = textarea.value.substring(end);
     textarea.value = before + startTag + selected + endTag + after;
     textarea.focus();
+    
     if (start === end) {
         textarea.selectionStart = textarea.selectionEnd = start + startTag.length;
     } else {
         textarea.selectionStart = start;
         textarea.selectionEnd = end + startTag.length + endTag.length;
     }
+    
+    // Trigger auto-save
+    textarea.dispatchEvent(new Event('input'));
 }
 
+// Insert link
 function insertLink() {
     const url = prompt("Enter the page name or URL for the link:");
     if (!url) return;
@@ -142,17 +425,23 @@ function insertLink() {
     const selected = textarea.value.substring(start, end) || url;
     const before = textarea.value.substring(0, start);
     const after = textarea.value.substring(end);
+    
     let formatted;
     if (url.match(/^(http|https):\/\//i)) {
         formatted = `[${selected}](${url})`;
     } else {
         formatted = `[[${selected}]]`;
     }
+    
     textarea.value = before + formatted + after;
     textarea.focus();
     textarea.selectionStart = textarea.selectionEnd = start + formatted.length;
+    
+    // Trigger auto-save
+    textarea.dispatchEvent(new Event('input'));
 }
 
+// Show image help
 function showImageHelp() {
     alert('Image Alignment:\n\n' +
           '![alt](url){.center} - Center image\n' +

@@ -18,6 +18,8 @@ return [
     
     'log_file' => __DIR__ . '/wiki.log',
     
+    'cache_dir' => __DIR__ . '/cache',
+    
     'default_page' => 'Home',
     
     'enable_auto_link' => true,

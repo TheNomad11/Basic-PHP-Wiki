@@ -10,6 +10,7 @@ $requestUri = $_SERVER['REQUEST_URI'] ?? '';
 $blockedPatterns = [
     '/\.json$/i',           // JSON files
     '/\.(md|txt)$/i',       // Markdown and text files
+    '/\.meta$/i',           // Metadata files
     '/\/(functions|protect|config)\.php$/i', // PHP includes
     '/rate_limits\.json$/i', // Rate limit data
     '/wiki\.log$/i'         // Log file

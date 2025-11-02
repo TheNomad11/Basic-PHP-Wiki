@@ -71,6 +71,20 @@ if (!is_dir($pagesDir)) {
     }
 }
 
+// Ensure cache directory exists
+if (!is_dir(CACHE_DIR)) {
+    if (!mkdir(CACHE_DIR, 0750, true) && !is_dir(CACHE_DIR)) {
+        logMessage("Failed to create cache directory", 'ERROR', $logFile);
+    }
+}
+
+// Check if search index needs rebuilding
+$rebuildMarker = CACHE_DIR . '/.rebuild_index';
+if (file_exists($rebuildMarker)) {
+    buildSearchIndex($pagesDir);
+    unlink($rebuildMarker);
+}
+
 // Session timeout (absolute timeout)
 if (isset($_SESSION['created']) && (time() - $_SESSION['created'] > $config['session_lifetime'])) {
     session_unset();
@@ -297,7 +311,7 @@ if ($pageSafe === 'AllTags') {
                 $contentWithoutCode = preg_replace('/`[^`]+`/', '', $contentWithoutCode);
                 $contentWithoutCode = preg_replace('/^[ ]{4,}.*/m', '', $contentWithoutCode);
 
-                if (preg_match_all('/#([a-zA-Z0-9_\-]+)/', $contentWithoutCode, $matches)) {
+                if (preg_match_all('/(?:^|\s)#([a-zA-Z0-9_\-]+)(?:\s|$)/m', $contentWithoutCode, $matches)) {
                     foreach ($matches[1] as $tag) {
                         if (strlen($tag) <= MAX_TAG_LENGTH) {
                             $allTags[$tag] = true;
@@ -328,7 +342,7 @@ if ($pageSafe === 'AllTags') {
     exit;
 }
 
-// --- Handle AllPages ---
+// --- Handle AllPages with pagination ---
 if ($pageSafe === 'AllPages') {
     $allPages = [];
     $files = glob("$pagesDir/*.md");
@@ -339,17 +353,93 @@ if ($pageSafe === 'AllPages') {
     }
     sort($allPages, SORT_NATURAL | SORT_FLAG_CASE);
     
-    renderPage('All Pages', function() use ($allPages) {
+    // Pagination
+    $totalPages = count($allPages);
+    $pageNum = isset($_GET['pagenum']) ? max(1, (int)$_GET['pagenum']) : 1;
+    $offset = ($pageNum - 1) * PAGES_PER_PAGE;
+    $paginatedPages = array_slice($allPages, $offset, PAGES_PER_PAGE);
+    $totalPageCount = ceil($totalPages / PAGES_PER_PAGE);
+    
+    renderPage('All Pages', function() use ($paginatedPages, $pageNum, $totalPageCount, $totalPages) {
         ?>
         <h1>All Pages</h1>
+        <p>Showing <?= count($paginatedPages) ?> of <?= $totalPages ?> pages</p>
         <ul>
-            <?php foreach ($allPages as $p): ?>
+            <?php foreach ($paginatedPages as $p): ?>
                 <li><a href="?page=<?= urlencode($p) ?>"><?= htmlspecialchars($p, ENT_QUOTES, 'UTF-8') ?></a></li>
             <?php endforeach; ?>
         </ul>
+        
+        <?php if ($totalPageCount > 1): ?>
+            <div class="pagination">
+                <?php if ($pageNum > 1): ?>
+                    <a href="?page=AllPages&pagenum=<?= $pageNum - 1 ?>" class="pagination-link">← Previous</a>
+                <?php endif; ?>
+                
+                <span class="pagination-info">Page <?= $pageNum ?> of <?= $totalPageCount ?></span>
+                
+                <?php if ($pageNum < $totalPageCount): ?>
+                    <a href="?page=AllPages&pagenum=<?= $pageNum + 1 ?>" class="pagination-link">Next →</a>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
         <?php
     }, $nonce);
     exit;
+}
+
+// --- Handle RecentChanges ---
+if ($pageSafe === 'RecentChanges') {
+    $recentChanges = getRecentChanges($pagesDir, 50);
+    
+    renderPage('Recent Changes', function() use ($recentChanges) {
+        ?>
+        <h1>Recent Changes</h1>
+        <p>The 50 most recently edited pages:</p>
+        <?php if (empty($recentChanges)): ?>
+            <p>No pages have been edited yet.</p>
+        <?php else: ?>
+            <div class="recent-changes-container">
+                <table class="recent-changes">
+                    <thead>
+                        <tr>
+                            <th>Page</th>
+                            <th>Last Modified</th>
+                            <th>Editor</th>
+                            <th>Time Ago</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($recentChanges as $change): ?>
+                            <tr>
+                                <td><a href="?page=<?= urlencode($change['page']) ?>"><?= htmlspecialchars($change['page'], ENT_QUOTES, 'UTF-8') ?></a></td>
+                                <td><?= htmlspecialchars($change['date'], ENT_QUOTES, 'UTF-8') ?></td>
+                                <td><?= htmlspecialchars($change['user'], ENT_QUOTES, 'UTF-8') ?></td>
+                                <td class="time-ago"><?= htmlspecialchars(formatTimeAgo($change['timestamp']), ENT_QUOTES, 'UTF-8') ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+        <?php
+    }, $nonce);
+    exit;
+}
+
+/**
+ * Format time ago helper for PHP
+ */
+function formatTimeAgo(int $timestamp): string
+{
+    $seconds = time() - $timestamp;
+    
+    if ($seconds < 60) return 'just now';
+    if ($seconds < 3600) return floor($seconds / 60) . ' minutes ago';
+    if ($seconds < 86400) return floor($seconds / 3600) . ' hours ago';
+    if ($seconds < 604800) return floor($seconds / 86400) . ' days ago';
+    if ($seconds < 2592000) return floor($seconds / 604800) . ' weeks ago';
+    return floor($seconds / 2592000) . ' months ago';
 }
 
 // --- File handling ---
@@ -411,7 +501,16 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
         die("Error: Failed to save the file.");
     }
     
+    // Save metadata (who edited and when)
     $username = $_SESSION['user'] ?? 'unknown';
+    savePageMetadata("$pagesDir/$pageSafe.md", $username);
+    
+    // Clear cache for this page
+    clearPageCache($pageSafe);
+    
+    // Rebuild search index in background (mark for rebuild)
+    touch(CACHE_DIR . '/.rebuild_index');
+    
     logMessage("Page saved: $pageSafe by user: $username", 'INFO', $logFile);
     
     header("Location: index.php?page=" . urlencode($pageSafe));
@@ -452,7 +551,7 @@ if (isset($_FILES['image']['tmp_name']) && is_uploaded_file($_FILES['image']['tm
     }
 }
 
-// --- Handle search with rate limiting ---
+// --- Handle search with indexed search ---
 $searchResults = [];
 $searchSnippets = [];
 if (isset($_GET['search']) && !empty($_GET['q'])) {
@@ -471,36 +570,9 @@ if (isset($_GET['search']) && !empty($_GET['q'])) {
         die("Too many search requests. Please wait a moment.");
     }
     
-    $qLower = strtolower($q);
-    $files = glob("$pagesDir/*.md");
-    if ($files !== false) {
-        foreach ($files as $filename) {
-            $basename = basename($filename, '.md');
-            $contents = file_get_contents($filename);
-            if ($contents === false) {
-                continue;
-            }
-            
-            if (stripos($contents, $qLower) !== false || stripos($basename, $qLower) !== false) {
-                $searchResults[] = $basename;
-                $snippet = '';
-                if (stripos($contents, $qLower) !== false) {
-                    $matchPos = stripos($contents, $qLower);
-                    $start = max(0, $matchPos - 60);
-                    $length = min(120, strlen($contents) - $start);
-                    $snippetRaw = substr($contents, $start, $length);
-                    $snippet = preg_replace(
-                        '/(' . preg_quote($q, '/') . ')/i',
-                        '<mark>$1</mark>',
-                        htmlspecialchars($snippetRaw, ENT_QUOTES, 'UTF-8')
-                    );
-                } elseif (stripos($basename, $qLower) !== false) {
-                    $snippet = '<mark>' . htmlspecialchars($basename, ENT_QUOTES, 'UTF-8') . '</mark> (name match)';
-                }
-                $searchSnippets[$basename] = $snippet;
-            }
-        }
-    }
+    // Use indexed search
+    $searchSnippets = searchWithIndex($q, $pagesDir);
+    $searchResults = array_keys($searchSnippets);
 }
 
 // --- Main page rendering ---
@@ -541,7 +613,20 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
         </form>
     <?php else: ?>
         <h1><?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></h1>
-        <div><?= parseMarkdownWithAutoLink($content, $pagesDir, $page, $enableAutoLink) ?></div>
+        <?php
+        // Try to get cached HTML
+        $cachedHtml = getCachedHtml($page, $content);
+        
+        if ($cachedHtml !== null) {
+            echo '<div>' . $cachedHtml . '</div>';
+        } else {
+            $html = parseMarkdownWithAutoLink($content, $pagesDir, $page, $enableAutoLink);
+            echo '<div>' . $html . '</div>';
+            
+            // Cache the parsed HTML
+            setCachedHtml($page, $content, $html);
+        }
+        ?>
         
         <div style="clear: both;"></div>
         

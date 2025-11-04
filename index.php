@@ -342,6 +342,23 @@ if ($pageSafe === 'AllTags') {
     exit;
 }
 
+// --- Handle cache clearing ---
+if (isset($_GET['action']) && $_GET['action'] === 'clearcache') {
+    // CSRF validation
+    if (!validateCsrfToken($_POST['csrf'] ?? '')) {
+        logMessage("CSRF token mismatch on cache clear", 'WARNING', $logFile);
+        http_response_code(403);
+        die("Security error: Invalid request");
+    }
+    
+    clearAllPageCaches();
+    $username = $_SESSION['user'] ?? 'unknown';
+    logMessage("Cache cleared by user: $username", 'INFO', $logFile);
+    
+    header("Location: index.php?page=AllPages&cleared=1");
+    exit;
+}
+
 // --- Handle AllPages with pagination ---
 if ($pageSafe === 'AllPages') {
     $allPages = [];
@@ -363,7 +380,21 @@ if ($pageSafe === 'AllPages') {
     renderPage('All Pages', function() use ($paginatedPages, $pageNum, $totalPageCount, $totalPages) {
         ?>
         <h1>All Pages</h1>
+        
+        <?php if (isset($_GET['cleared'])): ?>
+            <div style="padding: 10px; background-color: #d4edda; color: #155724; border-radius: 4px; margin-bottom: 1em;">
+                ✓ Cache cleared! Auto-links will be rebuilt when you view pages.
+            </div>
+        <?php endif; ?>
+        
         <p>Showing <?= count($paginatedPages) ?> of <?= $totalPages ?> pages</p>
+        
+        <form method="post" action="?action=clearcache" style="margin-bottom: 1em;">
+            <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+            <button type="submit" style="background-color: #6c757d;">🔄 Rebuild All Links</button>
+            <small style="color: #666; margin-left: 0.5em;">Use this if auto-links aren't working after creating new pages</small>
+        </form>
+        
         <ul>
             <?php foreach ($paginatedPages as $p): ?>
                 <li><a href="?page=<?= urlencode($p) ?>"><?= htmlspecialchars($p, ENT_QUOTES, 'UTF-8') ?></a></li>
@@ -480,6 +511,9 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
     
     $newContent = $_POST['content'];
     
+    // Check if this is a NEW page (doesn't exist yet)
+    $isNewPage = !file_exists("$pagesDir/$pageSafe.md");
+    
     // Atomic write
     $tempFile = "$pagesDir/$pageSafe.md.tmp." . bin2hex(random_bytes(8));
     $result = file_put_contents($tempFile, $newContent, LOCK_EX);
@@ -507,6 +541,12 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
     
     // Clear cache for this page
     clearPageCache($pageSafe);
+    
+    // If this is a NEW page, clear ALL caches to rebuild auto-links
+    if ($isNewPage) {
+        clearAllPageCaches();
+        logMessage("New page created: $pageSafe - cleared all caches for auto-link rebuild", 'INFO', $logFile);
+    }
     
     // Rebuild search index in background (mark for rebuild)
     touch(CACHE_DIR . '/.rebuild_index');
@@ -551,9 +591,13 @@ if (isset($_FILES['image']['tmp_name']) && is_uploaded_file($_FILES['image']['tm
     }
 }
 
-// --- Handle search with indexed search ---
+// --- Handle search with indexed search and pagination ---
 $searchResults = [];
 $searchSnippets = [];
+$searchTotalResults = 0;
+$searchPage = 1;
+$searchTotalPages = 1;
+
 if (isset($_GET['search']) && !empty($_GET['q'])) {
     $q = $_GET['q'];
     
@@ -570,11 +614,19 @@ if (isset($_GET['search']) && !empty($_GET['q'])) {
         die("Too many search requests. Please wait a moment.");
     }
     
-    // Use indexed search
-    $searchSnippets = searchWithIndex($q, $pagesDir);
+    // Use indexed search (get all results first)
+    $allSearchSnippets = searchWithIndex($q, $pagesDir);
+    $searchTotalResults = count($allSearchSnippets);
+    
+    // Pagination for search results
+    $searchPage = isset($_GET['searchpage']) ? max(1, (int)$_GET['searchpage']) : 1;
+    $searchTotalPages = ceil($searchTotalResults / SEARCH_RESULTS_PER_PAGE);
+    $searchPage = min($searchPage, max(1, $searchTotalPages)); // Ensure valid page
+    
+    $offset = ($searchPage - 1) * SEARCH_RESULTS_PER_PAGE;
+    $searchSnippets = array_slice($allSearchSnippets, $offset, SEARCH_RESULTS_PER_PAGE, true);
     $searchResults = array_keys($searchSnippets);
 }
-
 // --- Main page rendering ---
 renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEditing, $content, $page, $pageSafe, $pagesDir, $enableAutoLink, $uploadMessage, $nonce) {
     if (!empty($error)): ?>
@@ -582,16 +634,39 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
     <?php endif;
 
     if (!empty($searchResults)): ?>
-        <h2>Search Results for "<?= htmlspecialchars($_GET['q'] ?? '', ENT_QUOTES, 'UTF-8') ?>"</h2>
-        <ul>
-            <?php foreach ($searchResults as $result): ?>
-                <li>
-                    <a href="?page=<?= urlencode($result) ?>"><?= htmlspecialchars($result, ENT_QUOTES, 'UTF-8') ?></a>
-                    <?php if (!empty($searchSnippets[$result])): ?>
-                        <span class="snippet"><?= $searchSnippets[$result] ?></span>
-                    <?php endif; ?>
-                </li>
-            <?php endforeach; ?>
+    <h2>Search Results for "<?= htmlspecialchars($_GET['q'] ?? '', ENT_QUOTES, 'UTF-8') ?>"</h2>
+    
+    <p>
+        Found <?= $searchTotalResults ?> result<?= $searchTotalResults !== 1 ? 's' : '' ?>
+        <?php if ($searchTotalPages > 1): ?>
+            (showing page <?= $searchPage ?> of <?= $searchTotalPages ?>)
+        <?php endif; ?>
+    </p>
+    
+    <ul>
+        <?php foreach ($searchResults as $result): ?>
+            <li>
+                <a href="?page=<?= urlencode($result) ?>"><?= htmlspecialchars($result, ENT_QUOTES, 'UTF-8') ?></a>
+                <?php if (!empty($searchSnippets[$result])): ?>
+                    <span class="snippet"><?= $searchSnippets[$result] ?></span>
+                <?php endif; ?>
+            </li>
+        <?php endforeach; ?>
+    </ul>
+    
+    <?php if ($searchTotalPages > 1): ?>
+        <div class="pagination">
+            <?php if ($searchPage > 1): ?>
+                <a href="?search=1&q=<?= urlencode($_GET['q']) ?>&searchpage=<?= $searchPage - 1 ?>" class="pagination-link">← Previous</a>
+            <?php endif; ?>
+            
+            <span class="pagination-info">Page <?= $searchPage ?> of <?= $searchTotalPages ?></span>
+            
+            <?php if ($searchPage < $searchTotalPages): ?>
+                <a href="?search=1&q=<?= urlencode($_GET['q']) ?>&searchpage=<?= $searchPage + 1 ?>" class="pagination-link">Next →</a>
+            <?php endif; ?>
+        </div>
+    <?php endif; ?>
         </ul>
     <?php elseif ($isEditing): ?>
         <h2>Editing: <?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></h2>

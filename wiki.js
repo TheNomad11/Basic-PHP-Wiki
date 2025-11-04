@@ -1,8 +1,13 @@
-// wiki.js - External JavaScript file for the wiki with auto-save
+// wiki.js - External JavaScript file for the wiki with improved auto-save
 
-// Auto-save functionality
+// Auto-save configuration
+const AUTO_SAVE_DELAY = 5000; // 5 seconds (increased from 2)
+const AUTO_SAVE_MIN_CHANGES = 10; // Minimum characters changed before saving
+
+// Auto-save state
 let autoSaveTimer = null;
 let lastSavedContent = '';
+let lastCheckedContent = '';
 let saveInProgress = false;
 
 // Test localStorage availability immediately
@@ -17,7 +22,7 @@ try {
 
 // Wait for DOM to be ready
 document.addEventListener('DOMContentLoaded', function() {
-    console.log('Wiki.js loaded'); // Debug log
+    console.log('Wiki.js loaded');
     
     // Attach event listeners to toolbar buttons
     const btnBold = document.getElementById('btn-bold');
@@ -59,10 +64,10 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Initialize auto-save if we're in edit mode
     if (editbox) {
-        console.log('Edit box found, initializing auto-save'); // Debug log
+        console.log('Edit box found, initializing auto-save');
         initAutoSave();
     } else {
-        console.log('No edit box found'); // Debug log
+        console.log('No edit box found');
     }
 });
 
@@ -74,34 +79,35 @@ function initAutoSave() {
         return;
     }
     
-    console.log('Auto-save initialized'); // Debug log
+    console.log('Auto-save initialized with ' + (AUTO_SAVE_DELAY / 1000) + 's delay');
     
     // Store initial content
     lastSavedContent = editbox.value;
+    lastCheckedContent = editbox.value;
     
     // Load any draft from localStorage
     const pageName = getPageName();
     const draftKey = 'wiki_draft_' + pageName;
     
-    console.log('Checking for draft with key:', draftKey); // Debug log
+    console.log('Checking for draft with key:', draftKey);
     
     try {
         const savedDraft = localStorage.getItem(draftKey);
         const draftTimestamp = localStorage.getItem(draftKey + '_time');
         
-        console.log('Saved draft:', savedDraft ? 'Found' : 'Not found'); // Debug log
+        console.log('Saved draft:', savedDraft ? 'Found' : 'Not found');
         
         if (savedDraft && savedDraft !== lastSavedContent) {
             const draftDate = draftTimestamp ? new Date(parseInt(draftTimestamp)) : null;
             const timeAgo = draftDate ? formatTimeAgo(draftDate) : 'earlier';
             
             // Check if the draft is very recent (within last 5 seconds)
-            // This prevents asking about drafts that were just saved during navigation
             const isVeryRecent = draftDate && (Date.now() - draftDate.getTime()) < 5000;
             
             if (!isVeryRecent && confirm(`A draft was saved ${timeAgo}. Would you like to restore it?`)) {
                 editbox.value = savedDraft;
                 lastSavedContent = savedDraft;
+                lastCheckedContent = savedDraft;
                 showStatus('Draft restored', 'success');
             } else {
                 // Clear the draft if user declined or if it's too recent
@@ -116,22 +122,35 @@ function initAutoSave() {
     // Add status indicator
     addStatusIndicator();
     
-    // Listen for changes
+    // Listen for changes with improved logic
     editbox.addEventListener('input', function() {
-        console.log('Input event triggered'); // Debug log
+        const currentContent = editbox.value;
+        
+        // Calculate change size
+        const changeSize = Math.abs(currentContent.length - lastCheckedContent.length);
         
         // Clear existing timer
         if (autoSaveTimer) {
             clearTimeout(autoSaveTimer);
         }
         
-        // Show "unsaved" status
-        updateStatus('unsaved');
+        // Only show "unsaved" if there are meaningful changes
+        if (currentContent !== lastSavedContent && changeSize >= AUTO_SAVE_MIN_CHANGES) {
+            updateStatus('unsaved');
+        }
         
-        // Set new timer (save after 2 seconds of inactivity)
+        // Set new timer
         autoSaveTimer = setTimeout(function() {
-            saveDraft();
-        }, 2000);
+            // Only save if content changed significantly
+            if (currentContent !== lastSavedContent) {
+                const totalChange = Math.abs(currentContent.length - lastSavedContent.length);
+                
+                if (totalChange >= AUTO_SAVE_MIN_CHANGES) {
+                    saveDraft();
+                    lastCheckedContent = currentContent;
+                }
+            }
+        }, AUTO_SAVE_DELAY);
     });
     
     // Update the display every minute to show relative time
@@ -148,14 +167,13 @@ function initAutoSave() {
                 statusDiv.textContent = '✓ Draft saved at ' + timeStr;
             }
         }
-    }, 60000); // Update every minute
+    }, 60000);
     
     // Save on page unload
     window.addEventListener('beforeunload', function(e) {
         const editbox = document.getElementById('editbox');
         if (editbox && editbox.value !== lastSavedContent && !saveInProgress) {
             saveDraft(true); // Synchronous save
-            // Note: Modern browsers may ignore custom messages
             e.preventDefault();
             e.returnValue = 'You have unsaved changes. Are you sure you want to leave?';
             return e.returnValue;
@@ -166,8 +184,8 @@ function initAutoSave() {
     const editForm = document.getElementById('editForm');
     if (editForm) {
         editForm.addEventListener('submit', function(e) {
-            console.log('Form submitted, clearing draft'); // Debug log
-            saveInProgress = true; // Set flag to prevent beforeunload from saving
+            console.log('Form submitted, clearing draft');
+            saveInProgress = true;
             const pageName = getPageName();
             const draftKey = 'wiki_draft_' + pageName;
             try {
@@ -275,7 +293,7 @@ function saveDraft(synchronous = false) {
         return;
     }
     
-    console.log('Saving draft...'); // Debug log
+    console.log('Saving draft...');
     updateStatus('saving');
     
     try {
@@ -292,7 +310,7 @@ function saveDraft(synchronous = false) {
         const saveTime = new Date(now);
         const timeStr = saveTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         updateStatus('saved', timeStr);
-        console.log('Draft saved successfully at', timeStr); // Debug log
+        console.log('Draft saved successfully at', timeStr);
     } catch (e) {
         console.error('Failed to save draft:', e);
         updateStatus('error');
@@ -308,7 +326,7 @@ function saveDraft(synchronous = false) {
 function getPageName() {
     const params = new URLSearchParams(window.location.search);
     const pageName = params.get('page') || 'Home';
-    console.log('Current page name:', pageName); // Debug log
+    console.log('Current page name:', pageName);
     return pageName;
 }
 

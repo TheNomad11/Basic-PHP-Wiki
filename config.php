@@ -37,6 +37,9 @@ return [
     
     'max_content_size' => 1048576, // 1MB
     
+    // Revision settings (SIMPLIFIED)
+    'max_revisions' => 10, // Keep last 10 revisions
+    
     // Allowed image types
     'allowed_image_types' => [
         IMAGETYPE_JPEG => 'jpg',

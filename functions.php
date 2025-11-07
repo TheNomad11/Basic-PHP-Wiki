@@ -8,7 +8,7 @@ $config = require __DIR__ . '/config.php';
 define('PAGES_DIR', $config['pages_dir']);
 define('UPLOADS_DIR', $config['uploads_dir']);
 define('SESSIONS_DIR', $config['sessions_dir'] ?? __DIR__ . '/sessions');
-define('USERS_FILE', $config['users_file'] ?? __DIR__ . '/users.json');
+define('USERS_FILE', $config['users_file'] ?? __DIR__ . '/users.json.php');
 define('RATE_LIMIT_FILE', $config['rate_limit_file']);
 define('LOG_FILE', $config['log_file']);
 define('TRUST_PROXY', false);
@@ -90,7 +90,84 @@ function getClientIp(): string
 }
 
 // -----------------------------
-// Atomic read/write helpers for JSON files (with locking)
+// NEW: Protected JSON file helpers
+// -----------------------------
+/**
+/**
+ * Read JSON file, stripping PHP protection header if present
+ */
+function readProtectedJsonFile(string $file): array
+{
+    if (!file_exists($file)) {
+        return [];
+    }
+
+    $content = file_get_contents($file);
+    if ($content === false) {
+        return [];
+    }
+
+    // Strip PHP protection header if present
+    $content = preg_replace('/^<\?php[^?]*\?>\s*/s', '', $content);
+
+    $data = json_decode($content, true);
+    return is_array($data) ? $data : [];
+}
+
+
+/**
+ * Write JSON file with PHP protection header
+ */
+function writeProtectedJsonFile(string $file, array $data): bool
+{
+    $dir = dirname($file);
+    if (!is_dir($dir)) {
+        if (!mkdir($dir, 0750, true) && !is_dir($dir)) {
+            logMessage("Failed to create directory: $dir", 'ERROR');
+            return false;
+        }
+    }
+    
+    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    $protected = "<?php http_response_code(403); die('Access denied'); ?>\n" . $json;
+    
+    $result = file_put_contents($file, $protected, LOCK_EX);
+    if ($result !== false) {
+        chmod($file, 0600);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Load users from JSON file with PHP protection support
+ */
+function loadUsersFile(string $usersFile = USERS_FILE): array
+{
+    if (!file_exists($usersFile)) {
+        return [];
+    }
+    
+    $content = file_get_contents($usersFile);
+    if ($content === false) {
+        logMessage("Failed to read users file: $usersFile", 'ERROR');
+        return [];
+    }
+    
+    // Strip PHP protection header if present
+    $content = preg_replace('/^<\?php[^?]*\?>\s*/s', '', $content);
+    
+    $users = json_decode($content, true);
+    if (!is_array($users)) {
+        logMessage("Invalid users file format: $usersFile", 'ERROR');
+        return [];
+    }
+    
+    return $users;
+}
+
+// -----------------------------
+// Atomic read/write helpers for JSON files (with locking) - UPDATED
 // -----------------------------
 function readJsonFileLocked(string $file): array
 {
@@ -106,6 +183,8 @@ function readJsonFileLocked(string $file): array
     if (flock($fh, LOCK_SH)) {
         $contents = stream_get_contents($fh);
         if ($contents !== false) {
+            // Strip PHP protection header if present
+            $contents = preg_replace('/^<\?php[^?]*\?>\s*/s', '', $contents);
             $decoded = json_decode($contents, true);
             $data = is_array($decoded) ? $decoded : [];
         }
@@ -132,13 +211,22 @@ function writeJsonFileLocked(string $file, array $data): bool
     }
     $success = false;
     if (flock($fh, LOCK_EX)) {
-        $written = fwrite($fh, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        
+        // Add PHP protection header if filename ends with .php
+        if (substr($file, -4) === '.php') {
+            $json = "<?php http_response_code(403); die('Access denied'); ?>\n" . $json;
+        }
+        
+        $written = fwrite($fh, $json);
         fflush($fh);
         flock($fh, LOCK_UN);
         if ($written !== false) {
             $success = rename($tmp, $file);
             if (!$success) {
                 logMessage("Failed to rename temp file to: $file", 'ERROR');
+            } else {
+                chmod($file, 0600);
             }
         }
     }
@@ -1096,13 +1184,8 @@ function renderPage(string $title, callable $contentCallback, string $nonce = ''
 
 function validateUserPasswords(string $usersFile = USERS_FILE): array
 {
-    if (!file_exists($usersFile)) {
-        return [];
-    }
-    $users = json_decode(file_get_contents($usersFile), true);
-    if (!is_array($users)) {
-        return [];
-    }
+    $users = loadUsersFile($usersFile);
+    
     $invalid = [];
     foreach ($users as $username => $hash) {
         $info = password_get_info($hash);

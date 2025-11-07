@@ -9,7 +9,7 @@ $requestUri = $_SERVER['REQUEST_URI'] ?? '';
 // Block access to sensitive files
 $blockedPatterns = [
     '/\.json$/i',           // JSON files
-    '/\.(md|txt)$/i',       // Markdown and text files
+    '/\.(md|txt)$/i',       // Markdown and text files (includes .md.rev files)
     '/\.meta$/i',           // Metadata files
     '/\/(functions|protect|config)\.php$/i', // PHP includes
     '/rate_limits\.json$/i', // Rate limit data

@@ -26,12 +26,11 @@ define('CACHE_DIR', $config['cache_dir'] ?? __DIR__ . '/cache');
 define('SEARCH_INDEX_FILE', CACHE_DIR . '/search_index.json');
 define('PAGES_PER_PAGE', 50);
 define('SEARCH_RESULTS_PER_PAGE', 20);
-define('PAGE_LIST_CACHE_TIME', 300); // 5 minutes cache for page list
+define('PAGE_LIST_CACHE_TIME', 300);
+define('MAX_REVISIONS', $config['max_revisions'] ?? 10);
 
-// Require Parsedown
 require_once 'Parsedown.php';
 
-// In-memory cache for page names (prevents repeated disk reads)
 $_pageNamesCache = null;
 $_pageNamesCacheTime = 0;
 
@@ -43,23 +42,19 @@ function logMessage(string $message, string $level = 'INFO', string $logFile = L
     if (empty($logFile)) {
         return false;
     }
-
     $timestamp = gmdate('Y-m-d H:i:s');
     $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
     $logEntry = "[$timestamp] [$level] [$ip] $message\n";
-
     $dir = dirname($logFile);
     if (!is_dir($dir)) {
         if (!mkdir($dir, 0750, true) && !is_dir($dir)) {
             return false;
         }
     }
-
     $fh = fopen($logFile, 'a');
     if ($fh === false) {
         return false;
     }
-
     $success = false;
     if (flock($fh, LOCK_EX)) {
         fwrite($fh, $logEntry);
@@ -68,7 +63,6 @@ function logMessage(string $message, string $level = 'INFO', string $logFile = L
         $success = true;
     }
     fclose($fh);
-    
     return $success;
 }
 
@@ -103,13 +97,11 @@ function readJsonFileLocked(string $file): array
     if (!file_exists($file)) {
         return [];
     }
-
     $fh = fopen($file, 'r');
     if ($fh === false) {
         logMessage("Failed to open file for reading: $file", 'ERROR');
         return [];
     }
-
     $data = [];
     if (flock($fh, LOCK_SH)) {
         $contents = stream_get_contents($fh);
@@ -132,20 +124,17 @@ function writeJsonFileLocked(string $file, array $data): bool
             return false;
         }
     }
-
     $tmp = $file . '.tmp.' . bin2hex(random_bytes(8));
     $fh = fopen($tmp, 'w');
     if ($fh === false) {
         logMessage("Failed to create temp file: $tmp", 'ERROR');
         return false;
     }
-
     $success = false;
     if (flock($fh, LOCK_EX)) {
         $written = fwrite($fh, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
         fflush($fh);
         flock($fh, LOCK_UN);
-        
         if ($written !== false) {
             $success = rename($tmp, $file);
             if (!$success) {
@@ -154,11 +143,9 @@ function writeJsonFileLocked(string $file, array $data): bool
         }
     }
     fclose($fh);
-
     if (!$success && file_exists($tmp)) {
         unlink($tmp);
     }
-
     return $success;
 }
 
@@ -169,8 +156,6 @@ function checkRateLimit(string $identifier, string $rateLimitFile = RATE_LIMIT_F
 {
     $rateLimits = readJsonFileLocked($rateLimitFile);
     $now = time();
-
-    // Cleanup expired entries
     $cleaned = false;
     foreach ($rateLimits as $k => $v) {
         if (!isset($v['first']) || ($now - (int)$v['first']) > $blockDuration) {
@@ -178,24 +163,19 @@ function checkRateLimit(string $identifier, string $rateLimitFile = RATE_LIMIT_F
             $cleaned = true;
         }
     }
-    
     if ($cleaned) {
         writeJsonFileLocked($rateLimitFile, $rateLimits);
     }
-
     if (!isset($rateLimits[$identifier])) {
         return true;
     }
-
     $entry = $rateLimits[$identifier];
-    
     if (($entry['count'] ?? 0) >= $maxAttempts) {
         $elapsed = $now - (int)$entry['first'];
         if ($elapsed < $blockDuration) {
             return false;
         }
     }
-
     return true;
 }
 
@@ -203,13 +183,11 @@ function recordFailedAttempt(string $identifier, string $rateLimitFile = RATE_LI
 {
     $rateLimits = readJsonFileLocked($rateLimitFile);
     $now = time();
-
     if (!isset($rateLimits[$identifier]) || ($now - (int)$rateLimits[$identifier]['first']) > RATE_BLOCK_SECONDS) {
         $rateLimits[$identifier] = ['count' => 1, 'first' => $now];
     } else {
         $rateLimits[$identifier]['count'] = ($rateLimits[$identifier]['count'] ?? 0) + 1;
     }
-
     writeJsonFileLocked($rateLimitFile, $rateLimits);
 }
 
@@ -218,6 +196,247 @@ function resetRateLimit(string $identifier, string $rateLimitFile = RATE_LIMIT_F
     $rateLimits = readJsonFileLocked($rateLimitFile);
     unset($rateLimits[$identifier]);
     writeJsonFileLocked($rateLimitFile, $rateLimits);
+}
+
+// -----------------------------
+// SIMPLIFIED Version History Functions
+// Revisions stored as: PageName.md.rev.TIMESTAMP
+// Same folder, markdown format, super simple!
+// -----------------------------
+
+/**
+ * Save a revision of a page
+ * Creates: pages/PageName.md.rev.1234567890
+ */
+function saveRevision(string $pageName, string $content, string $user): bool
+{
+    $pagesDir = PAGES_DIR;
+    $timestamp = time();
+    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
+    
+    // Write the revision file (just the markdown content!)
+    $result = file_put_contents($revisionFile, $content, LOCK_EX);
+    
+    if ($result === false) {
+        logMessage("Failed to save revision for: $pageName", 'ERROR');
+        return false;
+    }
+    
+    chmod($revisionFile, 0644);
+    
+    // Save metadata in a companion file
+    $metaFile = $revisionFile . '.meta';
+    $metadata = [
+        'user' => $user,
+        'timestamp' => $timestamp,
+        'date' => date('Y-m-d H:i:s', $timestamp)
+    ];
+    file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX);
+    chmod($metaFile, 0644);
+    
+    // Cleanup old revisions
+    cleanupOldRevisions($pageName);
+    
+    return true;
+}
+
+/**
+ * Get all revisions for a page
+ * Returns array with revision info
+ */
+function getRevisions(string $pageName): array
+{
+    $pagesDir = PAGES_DIR;
+    $pattern = $pagesDir . '/' . $pageName . '.md.rev.*';
+    $files = glob($pattern);
+    
+    if ($files === false) {
+        return [];
+    }
+    
+    $revisions = [];
+    
+    foreach ($files as $file) {
+        // Skip .meta files
+        if (strpos($file, '.meta') !== false) {
+            continue;
+        }
+        
+        // Extract timestamp from filename
+        if (preg_match('/\.md\.rev\.(\d+)$/', $file, $matches)) {
+            $timestamp = (int)$matches[1];
+            
+            // Try to load metadata
+            $metaFile = $file . '.meta';
+            $user = 'unknown';
+            if (file_exists($metaFile)) {
+                $meta = json_decode(file_get_contents($metaFile), true);
+                if (is_array($meta) && isset($meta['user'])) {
+                    $user = $meta['user'];
+                }
+            }
+            
+            $revisions[] = [
+                'timestamp' => $timestamp,
+                'date' => date('Y-m-d H:i:s', $timestamp),
+                'user' => $user,
+                'file' => $file
+            ];
+        }
+    }
+    
+    // Sort by timestamp descending (newest first)
+    usort($revisions, function($a, $b) {
+        return $b['timestamp'] - $a['timestamp'];
+    });
+    
+    return $revisions;
+}
+
+/**
+ * Get content of a specific revision
+ */
+function getRevisionContent(string $pageName, int $timestamp): ?string
+{
+    $pagesDir = PAGES_DIR;
+    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
+    
+    if (!file_exists($revisionFile)) {
+        return null;
+    }
+    
+    $content = file_get_contents($revisionFile);
+    return $content !== false ? $content : null;
+}
+
+/**
+ * Restore a revision
+ * Simply copies the revision content back to the main page
+ */
+function restoreRevision(string $pageName, int $timestamp, string $user): bool
+{
+    $pagesDir = PAGES_DIR;
+    $pageFile = $pagesDir . '/' . $pageName . '.md';
+    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
+    
+    // Check if revision exists
+    if (!file_exists($revisionFile)) {
+        logMessage("Revision not found: $revisionFile", 'ERROR');
+        return false;
+    }
+    
+    // Read revision content
+    $revisionContent = file_get_contents($revisionFile);
+    if ($revisionContent === false) {
+        logMessage("Failed to read revision: $revisionFile", 'ERROR');
+        return false;
+    }
+    
+    // Save current content as a revision (if page exists and content is different)
+    if (file_exists($pageFile)) {
+        $currentContent = file_get_contents($pageFile);
+        if ($currentContent !== false && $currentContent !== $revisionContent) {
+            saveRevision($pageName, $currentContent, $user);
+        }
+    }
+    
+    // Write revision content to main page
+    $result = file_put_contents($pageFile, $revisionContent, LOCK_EX);
+    
+    if ($result === false) {
+        logMessage("Failed to restore revision to: $pageFile", 'ERROR');
+        return false;
+    }
+    
+    chmod($pageFile, 0644);
+    
+    // Update page metadata
+    savePageMetadata($pageFile, $user);
+    
+    // Clear all caches
+    clearAllPageCaches();
+    
+    logMessage("Restored revision for: $pageName (timestamp: $timestamp)", 'INFO');
+    
+    return true;
+}
+
+/**
+ * Cleanup old revisions - keep only the newest X revisions
+ */
+function cleanupOldRevisions(string $pageName): void
+{
+    $revisions = getRevisions($pageName);
+    
+    if (count($revisions) <= MAX_REVISIONS) {
+        return;
+    }
+    
+    // Delete oldest revisions (they're already sorted newest first)
+    $toDelete = array_slice($revisions, MAX_REVISIONS);
+    
+    foreach ($toDelete as $rev) {
+        if (isset($rev['file']) && file_exists($rev['file'])) {
+            unlink($rev['file']);
+            
+            // Also delete metadata file
+            $metaFile = $rev['file'] . '.meta';
+            if (file_exists($metaFile)) {
+                unlink($metaFile);
+            }
+        }
+    }
+}
+
+/**
+ * Generate a simple line-by-line diff
+ */
+function generateDiff(string $old, string $new): array
+{
+    $oldLines = explode("\n", $old);
+    $newLines = explode("\n", $new);
+    
+    $diff = [];
+    $maxLines = max(count($oldLines), count($newLines));
+    
+    for ($i = 0; $i < $maxLines; $i++) {
+        $oldLine = $oldLines[$i] ?? '';
+        $newLine = $newLines[$i] ?? '';
+        
+        if ($oldLine === $newLine) {
+            $diff[] = ['type' => 'unchanged', 'content' => $oldLine];
+        } elseif ($oldLine === '') {
+            $diff[] = ['type' => 'added', 'content' => $newLine];
+        } elseif ($newLine === '') {
+            $diff[] = ['type' => 'removed', 'content' => $oldLine];
+        } else {
+            $diff[] = ['type' => 'removed', 'content' => $oldLine];
+            $diff[] = ['type' => 'added', 'content' => $newLine];
+        }
+    }
+    
+    return $diff;
+}
+
+/**
+ * Get revision metadata
+ */
+function getRevisionMetadata(string $pageName, int $timestamp): ?array
+{
+    $pagesDir = PAGES_DIR;
+    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
+    $metaFile = $revisionFile . '.meta';
+    
+    if (!file_exists($metaFile)) {
+        return [
+            'user' => 'unknown',
+            'timestamp' => $timestamp,
+            'date' => date('Y-m-d H:i:s', $timestamp)
+        ];
+    }
+    
+    $meta = json_decode(file_get_contents($metaFile), true);
+    return is_array($meta) ? $meta : null;
 }
 
 // -----------------------------
@@ -270,7 +489,6 @@ function ensureUploadsDir(string $uploadsDir = UPLOADS_DIR): void
             return;
         }
     }
-    
     $htaccess = $uploadsDir . '/.htaccess';
     if (!file_exists($htaccess)) {
         $content = "Options -Indexes\n<FilesMatch \"\\.(php|phtml|php3|phps)$\">\n    Deny from all\n</FilesMatch>\n";
@@ -283,49 +501,38 @@ function ensureUploadsDir(string $uploadsDir = UPLOADS_DIR): void
 function handleImageUpload(array $file, string $uploadsDir = UPLOADS_DIR, int $maxSize = MAX_UPLOAD_SIZE): array
 {
     ensureUploadsDir($uploadsDir);
-
     if (!isset($file['error']) || $file['error'] !== UPLOAD_ERR_OK) {
         return ['success' => false, 'message' => 'Upload error occurred'];
     }
-    
     if (!is_uploaded_file($file['tmp_name'])) {
         return ['success' => false, 'message' => 'Possible file upload attack'];
     }
-    
     if ($file['size'] > $maxSize) {
         return ['success' => false, 'message' => 'File too large (max ' . round($maxSize/1024/1024, 1) . 'MB)'];
     }
-
     $imageInfo = @getimagesize($file['tmp_name']);
     if ($imageInfo === false) {
         return ['success' => false, 'message' => 'File is not a valid image'];
     }
-    
     [$width, $height, $imageType] = [$imageInfo[0], $imageInfo[1], $imageInfo[2]];
-
     if ($width > MAX_IMAGE_WIDTH || $height > MAX_IMAGE_HEIGHT) {
         return ['success' => false, 'message' => 'Image dimensions too large'];
     }
-
     $finfo = finfo_open(FILEINFO_MIME_TYPE);
     $mimeType = finfo_file($finfo, $file['tmp_name']);
     finfo_close($finfo);
-    
     $allowedMimes = [
         'image/jpeg' => 'jpg',
         'image/png'  => 'png',
         'image/gif'  => 'gif',
         'image/webp' => 'webp'
     ];
-    
     if (!isset($allowedMimes[$mimeType])) {
         return ['success' => false, 'message' => 'Invalid MIME type'];
     }
-
     $extension = $allowedMimes[$mimeType];
     $filename = date('Y-m-d_His') . '_' . bin2hex(random_bytes(8)) . '.' . $extension;
     $targetPath = $uploadsDir . '/' . $filename;
-
     $srcImg = null;
     switch ($mimeType) {
         case 'image/jpeg':
@@ -343,11 +550,9 @@ function handleImageUpload(array $file, string $uploadsDir = UPLOADS_DIR, int $m
             }
             break;
     }
-    
     if ($srcImg === false || $srcImg === null) {
         return ['success' => false, 'message' => 'Failed to process image'];
     }
-
     if ($width > MAX_IMAGE_WIDTH || $height > MAX_IMAGE_HEIGHT) {
         $ratio = min(MAX_IMAGE_WIDTH / $width, MAX_IMAGE_HEIGHT / $height);
         $newW = (int)($width * $ratio);
@@ -357,7 +562,6 @@ function handleImageUpload(array $file, string $uploadsDir = UPLOADS_DIR, int $m
         imagedestroy($srcImg);
         $srcImg = $tmpImg;
     }
-
     $saved = false;
     switch ($extension) {
         case 'jpg':
@@ -376,11 +580,9 @@ function handleImageUpload(array $file, string $uploadsDir = UPLOADS_DIR, int $m
             break;
     }
     imagedestroy($srcImg);
-
     if (!$saved) {
         return ['success' => false, 'message' => 'Failed to save processed image'];
     }
-
     chmod($targetPath, 0644);
     return ['success' => true, 'filename' => $filename];
 }
@@ -393,43 +595,34 @@ function cleanContentForTags(string $content): string
     $lines = explode("\n", $content);
     $cleanedLines = [];
     $inCodeBlock = false;
-    
     foreach ($lines as $line) {
         if (preg_match('/^\s*```/', $line)) {
             $inCodeBlock = !$inCodeBlock;
             continue;
         }
-        
         if ($inCodeBlock) {
             continue;
         }
-        
         if (preg_match('/^\s*#{1,6}\s/', $line)) {
             continue;
         }
-        
         if (preg_match('/^\s{4,}/', $line)) {
             continue;
         }
-        
         $cleanedLines[] = $line;
     }
-    
     $cleaned = implode("\n", $cleanedLines);
     $cleaned = preg_replace('/`[^`]+`/', '', $cleaned);
     $cleaned = preg_replace('/\[([^\]]+)\]\([^\)]+\)/', '$1', $cleaned);
-    
     return $cleaned;
 }
 
 function extractTags(string $content): array
 {
     $cleaned = cleanContentForTags($content);
-    
     if (preg_match_all('/(?:^|\s)#([a-zA-Z0-9_\-]+)(?:\s|$)/m', $cleaned, $matches)) {
         return array_unique($matches[1]);
     }
-    
     return [];
 }
 
@@ -437,17 +630,18 @@ function getAllTags(string $pagesDir = PAGES_DIR, int $maxTagLength = MAX_TAG_LE
 {
     $allTags = [];
     $files = glob($pagesDir . '/*.md');
-    
     if ($files === false) {
         return [];
     }
-    
     foreach ($files as $filename) {
+        // Skip revision files
+        if (strpos($filename, '.md.rev.') !== false) {
+            continue;
+        }
         $content = file_get_contents($filename);
         if ($content === false) {
             continue;
         }
-        
         $tags = extractTags($content);
         foreach ($tags as $tag) {
             if (strlen($tag) <= $maxTagLength) {
@@ -455,10 +649,8 @@ function getAllTags(string $pagesDir = PAGES_DIR, int $maxTagLength = MAX_TAG_LE
             }
         }
     }
-    
     $allTags = array_keys($allTags);
     sort($allTags, SORT_NATURAL | SORT_FLAG_CASE);
-    
     return $allTags;
 }
 
@@ -484,9 +676,7 @@ function parseMarkdown(string $text): string
         $tag = $m[2];
         return $prefix . '[#' . $tag . '](' . '?tag=' . rawurlencode($tag) . ')';
     }, $text);
-
     $text = preprocessWikiLinks($text);
-    
     $text = preg_replace_callback('/!\[([^\]]*)\]\(([^)]+)\)\{([^}]+)\}/', function($m) {
         $alt = $m[1];
         $url = $m[2];
@@ -494,22 +684,18 @@ function parseMarkdown(string $text): string
         $safeModifiers = str_replace('"', '&quot;', $modifiers);
         return '![' . $alt . '](' . $url . ' "IMGMOD:' . $safeModifiers . '")';
     }, $text);
-
     $parsedown = new Parsedown();
     $parsedown->setSafeMode(true);
     $html = $parsedown->text($text);
-
     $html = preg_replace_callback('/<a href="([^"]+)">#([^<]+)<\/a>/', function($m) {
         $href = sanitizeTextForAttr($m[1]);
         $tag  = htmlspecialchars($m[2], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         return '<a href="' . $href . '" class="tag">#' . $tag . '</a>';
     }, $html);
-
     $html = preg_replace_callback('/<img([^>]*)title="IMGMOD:([^"]+)"([^>]*)>/i', function($m) {
         $before = $m[1];
         $modifiers = $m[2];
         $after = $m[3];
-
         $classes = [];
         if (preg_match_all('/\.(\w[\w-]*)/', $modifiers, $cmatches)) {
             foreach ($cmatches[1] as $c) {
@@ -520,7 +706,6 @@ function parseMarkdown(string $text): string
         $style = ' style="max-width:100%; max-height:400px;"';
         return '<img' . $before . $classAttr . $style . $after . '>';
     }, $html);
-
     $html = preg_replace_callback('/<img((?:(?!style=)[^>])*)>/i', function($m) {
         $attrs = $m[1];
         if (stripos($attrs, 'style=') !== false) {
@@ -528,7 +713,6 @@ function parseMarkdown(string $text): string
         }
         return '<img' . $attrs . ' style="max-width:100%; max-height:400px;">';
     }, $html);
-
     return $html;
 }
 
@@ -538,34 +722,30 @@ function parseMarkdown(string $text): string
 function getAllPageNames(string $pagesDir = PAGES_DIR): array
 {
     global $_pageNamesCache, $_pageNamesCacheTime;
-    
-    // Return cached result if still fresh
     if ($_pageNamesCache !== null && (time() - $_pageNamesCacheTime) < PAGE_LIST_CACHE_TIME) {
         return $_pageNamesCache;
     }
-    
     $pages = [];
     if (!is_dir($pagesDir)) {
         if (!mkdir($pagesDir, 0755, true) && !is_dir($pagesDir)) {
             return [];
         }
     }
-    
     $files = glob($pagesDir . '/*.md');
     if ($files !== false) {
         foreach ($files as $f) {
+            // Skip revision files
+            if (strpos($f, '.md.rev.') !== false) {
+                continue;
+            }
             $pages[] = basename($f, '.md');
         }
     }
-    
     usort($pages, function($a, $b) { 
         return strlen($b) - strlen($a); 
     });
-    
-    // Cache the result
     $_pageNamesCache = $pages;
     $_pageNamesCacheTime = time();
-    
     return $pages;
 }
 
@@ -585,7 +765,6 @@ function autoLinkPageNames(string $text, string $pagesDir = PAGES_DIR, string $c
     $filtered = array_filter($allPages, function($p) use ($currentPage) {
         return strcasecmp($p, $currentPage) !== 0 && strlen($p) >= 3;
     });
-
     foreach ($filtered as $page) {
         $escapedPage = preg_quote($page, '/');
         $pattern = '/(?<!\[\[)(?<!\[)(?<!\#)\b(' . $escapedPage . ')\b(?!\]\])/i';
@@ -618,21 +797,16 @@ function getCachedHtml(string $pageName, string $content): ?string
             return null;
         }
     }
-    
     $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
     $hashFile = $cacheFile . '.hash';
-    
     if (!file_exists($cacheFile) || !file_exists($hashFile)) {
         return null;
     }
-    
     $currentHash = md5($content);
     $cachedHash = file_get_contents($hashFile);
-    
     if ($currentHash !== $cachedHash) {
         return null;
     }
-    
     return file_get_contents($cacheFile);
 }
 
@@ -644,96 +818,82 @@ function setCachedHtml(string $pageName, string $content, string $html): bool
             return false;
         }
     }
-    
     $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
     $hashFile = $cacheFile . '.hash';
-    
     $contentHash = md5($content);
-    
     $result1 = file_put_contents($cacheFile, $html, LOCK_EX);
     $result2 = file_put_contents($hashFile, $contentHash, LOCK_EX);
-    
     if ($result1 !== false && $result2 !== false) {
         chmod($cacheFile, 0644);
         chmod($hashFile, 0644);
         return true;
     }
-    
     return false;
 }
 
 function clearPageCache(string $pageName): void
 {
     global $_pageNamesCache;
-    
     $cacheDir = CACHE_DIR;
     $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
     $hashFile = $cacheFile . '.hash';
-    
     if (file_exists($cacheFile)) {
         unlink($cacheFile);
     }
     if (file_exists($hashFile)) {
         unlink($hashFile);
     }
-    
-    // Invalidate in-memory page list cache
     $_pageNamesCache = null;
 }
 
 function clearAllPageCaches(): void
 {
     global $_pageNamesCache;
-    
     $cacheDir = CACHE_DIR;
     if (!is_dir($cacheDir)) {
         return;
     }
-    
     $files = glob($cacheDir . '/*.html');
     if ($files !== false) {
         foreach ($files as $file) {
-            unlink($file);
+            if (file_exists($file)) {
+                unlink($file);
+            }
         }
     }
-    
     $hashFiles = glob($cacheDir . '/*.hash');
     if ($hashFiles !== false) {
         foreach ($hashFiles as $file) {
-            unlink($file);
+            if (file_exists($file)) {
+                unlink($file);
+            }
         }
     }
-    
-    // Invalidate in-memory page list cache
     $_pageNamesCache = null;
 }
 
 // -----------------------------
-// Search index functions (OPTIMIZED)
+// Search index functions
 // -----------------------------
 function buildSearchIndex(string $pagesDir = PAGES_DIR): bool
 {
     $index = [];
     $files = glob($pagesDir . '/*.md');
-    
     if ($files === false) {
         return false;
     }
-    
     foreach ($files as $file) {
+        // Skip revision files
+        if (strpos($file, '.md.rev.') !== false) {
+            continue;
+        }
         $pageName = basename($file, '.md');
         $content = file_get_contents($file);
-        
         if ($content === false) {
             continue;
         }
-        
-        // Remove markdown syntax for better search
         $searchableContent = strip_tags(parseMarkdown($content));
         $searchableContent = strtolower($searchableContent);
-        
-        // Store full content for accurate searching
-        // Index size is a trade-off for complete search coverage
         $index[$pageName] = [
             'name' => $pageName,
             'content' => $searchableContent,
@@ -741,23 +901,18 @@ function buildSearchIndex(string $pagesDir = PAGES_DIR): bool
             'mtime' => filemtime($file)
         ];
     }
-    
     return writeJsonFileLocked(SEARCH_INDEX_FILE, $index);
 }
 
 function getSearchIndex(string $pagesDir = PAGES_DIR): array
 {
     $indexFile = SEARCH_INDEX_FILE;
-    
-    // Check if index exists and is recent (less than 1 hour old)
     if (file_exists($indexFile)) {
         $indexAge = time() - filemtime($indexFile);
         if ($indexAge < 3600) {
             return readJsonFileLocked($indexFile);
         }
     }
-    
-    // Rebuild index
     buildSearchIndex($pagesDir);
     return readJsonFileLocked($indexFile);
 }
@@ -767,41 +922,32 @@ function searchWithIndex(string $query, string $pagesDir = PAGES_DIR, int $limit
     $index = getSearchIndex($pagesDir);
     $results = [];
     $queryLower = strtolower($query);
-    
     foreach ($index as $pageName => $data) {
-        // Stop if we have enough results
         if (count($results) >= $limit) {
             break;
         }
-        
-        // Search in page name (higher priority)
         if (stripos($data['name'], $query) !== false) {
             $results[$pageName] = '<mark>' . htmlspecialchars($data['name'], ENT_QUOTES, 'UTF-8') . '</mark> (name match)';
             continue;
         }
-        
-        // Search in content
         if (stripos($data['content'], $queryLower) !== false) {
             $pos = stripos($data['content'], $queryLower);
             $start = max(0, $pos - 60);
             $length = min(120, strlen($data['content']) - $start);
             $snippet = substr($data['content'], $start, $length);
-            
             $snippet = preg_replace(
                 '/(' . preg_quote($query, '/') . ')/i',
                 '<mark>$1</mark>',
                 htmlspecialchars($snippet, ENT_QUOTES, 'UTF-8')
             );
-            
             $results[$pageName] = $snippet;
         }
     }
-    
     return $results;
 }
 
 // -----------------------------
-// Backlinks & related pages (OPTIMIZED)
+// Backlinks & related pages
 // -----------------------------
 function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR, int $limit = 20): array
 {
@@ -809,29 +955,27 @@ function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR, int $li
     if (!is_dir($pagesDir)) {
         return $backlinks;
     }
-    
     $files = glob($pagesDir . '/*.md');
     if ($files === false) {
         return $backlinks;
     }
-
     $count = 0;
     foreach ($files as $file) {
-        // Stop if we have enough backlinks
+        // Skip revision files
+        if (strpos($file, '.md.rev.') !== false) {
+            continue;
+        }
         if ($count >= $limit) {
             break;
         }
-        
         $pageName = basename($file, '.md');
         if (strcasecmp($pageName, $currentPage) === 0) {
             continue;
         }
-        
         $content = file_get_contents($file);
         if ($content === false) {
             continue;
         }
-        
         if (preg_match('/\[\[' . preg_quote($currentPage, '/') . '\]\]/i', $content)) {
             $backlinks[] = $pageName;
             $count++;
@@ -843,45 +987,39 @@ function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR, int $li
 function getRelatedPagesByTags(string $currentPage, string $content, string $pagesDir = PAGES_DIR, int $limit = 5): array
 {
     $currentTags = extractTags($content);
-    
     if (empty($currentTags)) {
         return [];
     }
-
     $related = [];
     $files = glob($pagesDir . '/*.md');
     if ($files === false) {
         return [];
     }
-
     foreach ($files as $file) {
+        // Skip revision files
+        if (strpos($file, '.md.rev.') !== false) {
+            continue;
+        }
         $pageName = basename($file, '.md');
         if (strcasecmp($pageName, $currentPage) === 0) {
             continue;
         }
-        
         $otherContent = file_get_contents($file);
         if ($otherContent === false) {
             continue;
         }
-        
         $otherTags = extractTags($otherContent);
         $shared = array_intersect($currentTags, $otherTags);
-        
         if (count($shared) > 0) {
             $related[$pageName] = ['count' => count($shared), 'tags' => $shared];
         }
-        
-        // Early exit if we have enough candidates
         if (count($related) >= $limit * 3) {
             break;
         }
     }
-    
     uasort($related, function($a, $b) { 
         return $b['count'] - $a['count']; 
     });
-    
     return array_slice($related, 0, $limit, true);
 }
 
@@ -896,7 +1034,6 @@ function sendSecurityHeaders(string $nonce): void
     header('Referrer-Policy: no-referrer-when-downgrade');
     header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
     header('X-XSS-Protection: 1; mode=block');
-    
     if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
         header('Strict-Transport-Security: max-age=63072000; includeSubDomains; preload');
     }
@@ -962,12 +1099,10 @@ function validateUserPasswords(string $usersFile = USERS_FILE): array
     if (!file_exists($usersFile)) {
         return [];
     }
-    
     $users = json_decode(file_get_contents($usersFile), true);
     if (!is_array($users)) {
         return [];
     }
-    
     $invalid = [];
     foreach ($users as $username => $hash) {
         $info = password_get_info($hash);
@@ -975,7 +1110,6 @@ function validateUserPasswords(string $usersFile = USERS_FILE): array
             $invalid[] = $username;
         }
     }
-    
     return $invalid;
 }
 
@@ -984,32 +1118,29 @@ function getRecentChanges(string $pagesDir = PAGES_DIR, int $limit = 50): array
     if (!is_dir($pagesDir)) {
         return [];
     }
-    
     $changes = [];
     $files = glob($pagesDir . '/*.md');
-    
     if ($files === false) {
         return [];
     }
-    
     foreach ($files as $file) {
+        // Skip revision files
+        if (strpos($file, '.md.rev.') !== false) {
+            continue;
+        }
         $pageName = basename($file, '.md');
         $mtime = filemtime($file);
-        
         if ($mtime === false) {
             continue;
         }
-        
         $metaFile = $file . '.meta';
         $user = 'unknown';
-        
         if (file_exists($metaFile)) {
             $meta = json_decode(file_get_contents($metaFile), true);
             if (is_array($meta) && isset($meta['user'])) {
                 $user = $meta['user'];
             }
         }
-        
         $changes[] = [
             'page' => $pageName,
             'timestamp' => $mtime,
@@ -1017,11 +1148,9 @@ function getRecentChanges(string $pagesDir = PAGES_DIR, int $limit = 50): array
             'date' => date('Y-m-d H:i:s', $mtime)
         ];
     }
-    
     usort($changes, function($a, $b) {
         return $b['timestamp'] - $a['timestamp'];
     });
-    
     return array_slice($changes, 0, $limit);
 }
 
@@ -1033,13 +1162,10 @@ function savePageMetadata(string $pagePath, string $user): bool
         'timestamp' => time(),
         'date' => date('Y-m-d H:i:s')
     ];
-    
     $result = file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX);
-    
     if ($result !== false) {
         chmod($metaFile, 0644);
         return true;
     }
-    
     return false;
 }

@@ -4,11 +4,14 @@ declare(strict_types=1);
 // Load configuration FIRST
 $config = require __DIR__ . '/config.php';
 
+// Include functions
+require_once __DIR__ . '/functions.php';
+
+
 // Protection layer
 require_once __DIR__ . '/protect.php';
 
-// Include functions
-require_once __DIR__ . '/functions.php';
+
 
 // --- Start session with hardened settings ---
 if (session_status() !== PHP_SESSION_ACTIVE) {
@@ -108,18 +111,12 @@ if (isset($_SESSION['loggedin']) && isset($_SESSION['last_activity'])) {
     $_SESSION['last_activity'] = time();
 }
 
-// Load users
-$users = [];
-if (file_exists($usersFile)) {
-    $users = json_decode(file_get_contents($usersFile), true);
-    if (!is_array($users)) {
-        $users = [];
-        logMessage("Invalid users file format", 'ERROR', $logFile);
-    } else {
-        $invalid = validateUserPasswords($usersFile);
-        if (!empty($invalid)) {
-            logMessage("Found users with invalid password hashes: " . implode(', ', $invalid), 'CRITICAL', $logFile);
-        }
+// Load users - UPDATED to use new function
+$users = loadUsersFile($usersFile);
+if (!empty($users)) {
+    $invalid = validateUserPasswords($usersFile);
+    if (!empty($invalid)) {
+        logMessage("Found users with invalid password hashes: " . implode(', ', $invalid), 'CRITICAL', $logFile);
     }
 }
 

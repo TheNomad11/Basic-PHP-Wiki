@@ -7,7 +7,7 @@ $config = require __DIR__ . '/config.php';
 // Protection layer
 require_once __DIR__ . '/protect.php';
 
-// Include functions (does NOT start session)
+// Include functions
 require_once __DIR__ . '/functions.php';
 
 // --- Start session with hardened settings ---
@@ -116,7 +116,6 @@ if (file_exists($usersFile)) {
         $users = [];
         logMessage("Invalid users file format", 'ERROR', $logFile);
     } else {
-        // Validate password hashes
         $invalid = validateUserPasswords($usersFile);
         if (!empty($invalid)) {
             logMessage("Found users with invalid password hashes: " . implode(', ', $invalid), 'CRITICAL', $logFile);
@@ -127,7 +126,6 @@ if (file_exists($usersFile)) {
 // --- Handle login with rate limiting ---
 $error = '';
 if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['password'])) {
-    // CSRF validation using hash_equals
     if (!validateCsrfToken($_POST['csrf'] ?? '')) {
         logMessage('CSRF token mismatch on login', 'WARNING', $logFile);
         http_response_code(403);
@@ -136,7 +134,6 @@ if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['passw
 
     $clientIp = getClientIp();
     
-    // Check rate limit
     if (!checkRateLimit($clientIp, $rateLimitFile, $config['max_login_attempts'], $config['login_block_duration'])) {
         $minutesRemaining = ceil($config['login_block_duration'] / 60);
         logMessage("Rate limit exceeded for IP: $clientIp", 'WARNING', $logFile);
@@ -151,15 +148,11 @@ if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['passw
         recordFailedAttempt($clientIp, $rateLimitFile);
     } else {
         if (isset($users[$username]) && password_verify($_POST['password'], $users[$username])) {
-            // Successful login - regenerate session ID
             session_regenerate_id(true);
             $_SESSION['loggedin'] = true;
             $_SESSION['user'] = $username;
             $_SESSION['last_activity'] = time();
-            
-            // Reset rate limit for this IP
             resetRateLimit($clientIp, $rateLimitFile);
-            
             logMessage("Successful login: $username from IP: $clientIp", 'INFO', $logFile);
             header("Location: index.php");
             exit;
@@ -167,14 +160,13 @@ if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['passw
             recordFailedAttempt($clientIp, $rateLimitFile);
             $error = "Incorrect username or password.";
             logMessage("Failed login attempt for username: $username from IP: $clientIp", 'WARNING', $logFile);
-            sleep(2); // Slow down brute force
+            sleep(2);
         }
     }
 }
 
 // --- Handle logout ---
 if (isset($_GET['logout']) || isset($_POST['logout'])) {
-    // Validate CSRF for POST logout
     if (isset($_POST['logout']) && !validateCsrfToken($_POST['csrf'] ?? '')) {
         logMessage('CSRF token mismatch on logout', 'WARNING', $logFile);
         http_response_code(403);
@@ -227,7 +219,6 @@ if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
 // Determine current page with length validation
 $page = $_GET['page'] ?? $defaultPage;
 
-// Validate length BEFORE regex to prevent ReDoS
 if (strlen($page) > MAX_PAGE_NAME_LENGTH) {
     logMessage("Page name too long: " . strlen($page) . " chars", 'WARNING', $logFile);
     $page = $defaultPage;
@@ -259,7 +250,6 @@ if (file_exists($filePath)) {
 if (isset($_GET['tag'])) {
     $tag = $_GET['tag'];
     
-    // Validate length before regex
     if (strlen($tag) > MAX_TAG_LENGTH) {
         http_response_code(400);
         die("Invalid tag: too long");
@@ -276,6 +266,10 @@ if (isset($_GET['tag'])) {
     $files = glob("$pagesDir/*.md");
     if ($files !== false) {
         foreach ($files as $file) {
+            // Skip revision files
+            if (strpos($file, '.md.rev.') !== false) {
+                continue;
+            }
             $content = file_get_contents($file);
             if ($content !== false && preg_match('/(^|\s)#' . preg_quote($tag, '/') . '(\s|$)/', $content)) {
                 $results[] = basename($file, ".md");
@@ -301,29 +295,7 @@ if (isset($_GET['tag'])) {
 
 // --- Handle AllTags page ---
 if ($pageSafe === 'AllTags') {
-    $allTags = [];
-    $files = glob("$pagesDir/*.md");
-    if ($files !== false) {
-        foreach ($files as $filename) {
-            $content = file_get_contents($filename);
-            if ($content !== false) {
-                $contentWithoutCode = preg_replace('/```.*?```/s', '', $content);
-                $contentWithoutCode = preg_replace('/`[^`]+`/', '', $contentWithoutCode);
-                $contentWithoutCode = preg_replace('/^[ ]{4,}.*/m', '', $contentWithoutCode);
-
-                if (preg_match_all('/(?:^|\s)#([a-zA-Z0-9_\-]+)(?:\s|$)/m', $contentWithoutCode, $matches)) {
-                    foreach ($matches[1] as $tag) {
-                        if (strlen($tag) <= MAX_TAG_LENGTH) {
-                            $allTags[$tag] = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    $allTags = array_keys($allTags);
-    sort($allTags, SORT_NATURAL | SORT_FLAG_CASE);
+    $allTags = getAllTags($pagesDir);
     
     renderPage('All Tags', function() use ($allTags) {
         ?>
@@ -344,7 +316,6 @@ if ($pageSafe === 'AllTags') {
 
 // --- Handle cache clearing ---
 if (isset($_GET['action']) && $_GET['action'] === 'clearcache') {
-    // CSRF validation
     if (!validateCsrfToken($_POST['csrf'] ?? '')) {
         logMessage("CSRF token mismatch on cache clear", 'WARNING', $logFile);
         http_response_code(403);
@@ -361,16 +332,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'clearcache') {
 
 // --- Handle AllPages with pagination ---
 if ($pageSafe === 'AllPages') {
-    $allPages = [];
-    $files = glob("$pagesDir/*.md");
-    if ($files !== false) {
-        foreach ($files as $filename) {
-            $allPages[] = basename($filename, '.md');
-        }
-    }
+    $allPages = getAllPageNames($pagesDir);
     sort($allPages, SORT_NATURAL | SORT_FLAG_CASE);
     
-    // Pagination
     $totalPages = count($allPages);
     $pageNum = isset($_GET['pagenum']) ? max(1, (int)$_GET['pagenum']) : 1;
     $offset = ($pageNum - 1) * PAGES_PER_PAGE;
@@ -419,6 +383,211 @@ if ($pageSafe === 'AllPages') {
     exit;
 }
 
+// --- Handle revision history ---
+if (isset($_GET['history'])) {
+    $pageName = $_GET['page'] ?? $defaultPage;
+    
+    if (strlen($pageName) > MAX_PAGE_NAME_LENGTH) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
+    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
+    if (empty($pageSafe)) {
+        $pageSafe = $defaultPage;
+    }
+    
+    $revisions = getRevisions($pageSafe);
+    
+    renderPage('History: ' . $pageSafe, function() use ($pageSafe, $revisions) {
+        ?>
+        <h1>Revision History: <?= htmlspecialchars($pageSafe, ENT_QUOTES, 'UTF-8') ?></h1>
+        <p><a href="?page=<?= urlencode($pageSafe) ?>">← Back to page</a></p>
+        
+        <?php if (empty($revisions)): ?>
+            <p>No revision history available for this page.</p>
+        <?php else: ?>
+            <table class="revisions-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Editor</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($revisions as $i => $rev): ?>
+                        <tr>
+                            <td><?= htmlspecialchars($rev['date'], ENT_QUOTES, 'UTF-8') ?><br>
+                                <small style="color: #666;"><?= htmlspecialchars(formatTimeAgo($rev['timestamp']), ENT_QUOTES, 'UTF-8') ?></small>
+                            </td>
+                            <td><?= htmlspecialchars($rev['user'], ENT_QUOTES, 'UTF-8') ?></td>
+                            <td>
+                                <a href="?page=<?= urlencode($pageSafe) ?>&viewrev=<?= $rev['timestamp'] ?>">View</a>
+                                <?php if ($i < count($revisions) - 1): ?>
+                                    | <a href="?page=<?= urlencode($pageSafe) ?>&diff=<?= $rev['timestamp'] ?>&oldrev=<?= $revisions[$i + 1]['timestamp'] ?>">Diff</a>
+                                <?php endif; ?>
+                                | 
+                              
+<form method="post"
+      action="index.php?page=<?= urlencode($pageSafe) ?>"   
+      style="display: inline;"
+      onsubmit="return confirm('Restore this version? Current content will be saved as a revision.');">
+    <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+    <input type="hidden" name="restore_revision" value="<?= $rev['timestamp'] ?>">
+    <input type="hidden" name="page" value="<?= htmlspecialchars($pageSafe, ENT_QUOTES, 'UTF-8') ?>">
+    <button type="submit" style="background: none; border: none; color: #0066cc; text-decoration: underline; cursor: pointer; padding: 0; font-size: inherit;">Restore</button>
+</form>
+                                   
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+        <?php
+    }, $nonce);
+    exit;
+}
+
+// --- Handle view revision ---
+if (isset($_GET['viewrev'])) {
+    $pageName = $_GET['page'] ?? $defaultPage;
+    $timestamp = (int)$_GET['viewrev'];
+    
+    if (strlen($pageName) > MAX_PAGE_NAME_LENGTH) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
+    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
+    $revisionContent = getRevisionContent($pageSafe, $timestamp);
+    
+    if ($revisionContent === null) {
+        http_response_code(404);
+        die("Revision not found");
+    }
+    
+    $metadata = getRevisionMetadata($pageSafe, $timestamp);
+    
+    renderPage('Revision: ' . $pageSafe, function() use ($pageSafe, $revisionContent, $metadata, $pagesDir, $enableAutoLink) {
+        ?>
+        <div style="background-color: #fff3cd; padding: 1em; border-radius: 4px; margin-bottom: 1em;">
+            <strong>⚠️ Viewing historical revision from <?= htmlspecialchars($metadata['date'], ENT_QUOTES, 'UTF-8') ?></strong><br>
+            Edited by: <?= htmlspecialchars($metadata['user'], ENT_QUOTES, 'UTF-8') ?><br>
+            <a href="?page=<?= urlencode($pageSafe) ?>">← View current version</a> | 
+            <a href="?page=<?= urlencode($pageSafe) ?>&history=1">← Back to history</a>
+        </div>
+        
+        <h1><?= htmlspecialchars($pageSafe, ENT_QUOTES, 'UTF-8') ?></h1>
+        
+        <?php
+        $html = parseMarkdownWithAutoLink($revisionContent, $pagesDir, $pageSafe, $enableAutoLink);
+        echo '<div>' . $html . '</div>';
+        ?>
+        <?php
+    }, $nonce);
+    exit;
+}
+
+// --- Handle diff view ---
+if (isset($_GET['diff'])) {
+    $pageName = $_GET['page'] ?? $defaultPage;
+    $newTimestamp = (int)$_GET['diff'];
+    $oldTimestamp = (int)$_GET['oldrev'];
+    
+    if (strlen($pageName) > MAX_PAGE_NAME_LENGTH) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
+    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
+    $newContent = getRevisionContent($pageSafe, $newTimestamp);
+    $oldContent = getRevisionContent($pageSafe, $oldTimestamp);
+    
+    if ($newContent === null || $oldContent === null) {
+        http_response_code(404);
+        die("Revision not found");
+    }
+    
+    $newMetadata = getRevisionMetadata($pageSafe, $newTimestamp);
+    $oldMetadata = getRevisionMetadata($pageSafe, $oldTimestamp);
+    $diff = generateDiff($oldContent, $newContent);
+    
+    renderPage('Diff: ' . $pageSafe, function() use ($pageSafe, $oldMetadata, $newMetadata, $diff) {
+        ?>
+        <h1>Comparing Revisions: <?= htmlspecialchars($pageSafe, ENT_QUOTES, 'UTF-8') ?></h1>
+        
+        <p><a href="?page=<?= urlencode($pageSafe) ?>&history=1">← Back to history</a></p>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1em; margin-bottom: 1em;">
+            <div>
+                <strong>Older Version</strong><br>
+                <?= htmlspecialchars($oldMetadata['date'], ENT_QUOTES, 'UTF-8') ?><br>
+                By: <?= htmlspecialchars($oldMetadata['user'], ENT_QUOTES, 'UTF-8') ?>
+            </div>
+            <div>
+                <strong>Newer Version</strong><br>
+                <?= htmlspecialchars($newMetadata['date'], ENT_QUOTES, 'UTF-8') ?><br>
+                By: <?= htmlspecialchars($newMetadata['user'], ENT_QUOTES, 'UTF-8') ?>
+            </div>
+        </div>
+        
+        <div class="diff-container">
+            <pre class="diff-view"><?php
+            foreach ($diff as $line) {
+                $class = '';
+                $symbol = '  ';
+                if ($line['type'] === 'added') {
+                    $class = 'diff-added';
+                    $symbol = '+ ';
+                } elseif ($line['type'] === 'removed') {
+                    $class = 'diff-removed';
+                    $symbol = '- ';
+                }
+                echo '<div class="' . $class . '">' . htmlspecialchars($symbol . $line['content'], ENT_QUOTES, 'UTF-8') . '</div>';
+            }
+            ?></pre>
+        </div>
+        <?php
+    }, $nonce);
+    exit;
+}
+
+// --- Handle restore revision ---
+if (isset($_POST['restore_revision']) && isset($_POST['page'])) {
+    if (!validateCsrfToken($_POST['csrf'] ?? '')) {
+        logMessage("CSRF token mismatch on restore revision", 'WARNING', $logFile);
+        http_response_code(403);
+        die("Security error: Invalid request");
+    }
+    
+    $timestamp = (int)$_POST['restore_revision'];
+    $pageName = $_POST['page'];
+    
+    if (strlen($pageName) > MAX_PAGE_NAME_LENGTH) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
+    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
+    if (empty($pageSafe)) {
+        $pageSafe = $defaultPage;
+    }
+    
+    $username = $_SESSION['user'] ?? 'unknown';
+    
+    if (restoreRevision($pageSafe, $timestamp, $username)) {
+        logMessage("Revision restored for page: $pageSafe (timestamp: $timestamp) by user: $username", 'INFO', $logFile);
+        header("Location: index.php?page=" . urlencode($pageSafe) . "&restored=1");
+        exit;
+    } else {
+        logMessage("Failed to restore revision for page: $pageSafe (timestamp: $timestamp)", 'ERROR', $logFile);
+        http_response_code(500);
+        die("Failed to restore revision. Check the error log for details.");
+    }
+}
+
 // --- Handle RecentChanges ---
 if ($pageSafe === 'RecentChanges') {
     $recentChanges = getRecentChanges($pagesDir, 50);
@@ -458,13 +627,9 @@ if ($pageSafe === 'RecentChanges') {
     exit;
 }
 
-/**
- * Format time ago helper for PHP
- */
 function formatTimeAgo(int $timestamp): string
 {
     $seconds = time() - $timestamp;
-    
     if ($seconds < 60) return 'just now';
     if ($seconds < 3600) return floor($seconds / 60) . ' minutes ago';
     if ($seconds < 86400) return floor($seconds / 3600) . ' hours ago';
@@ -484,14 +649,12 @@ $isEditing = isset($_GET['edit']) && ($_SESSION['loggedin'] ?? false);
 
 // --- Save edits with rate limiting ---
 if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
-    // CSRF validation
     if (!validateCsrfToken($_POST['csrf'] ?? '')) {
         logMessage("CSRF token mismatch on save", 'WARNING', $logFile);
         http_response_code(403);
         die("Security error: Invalid request");
     }
 
-    // Rate limit edits per user
     $userIdentifier = 'edit_' . ($_SESSION['user'] ?? 'unknown');
     if (!checkRateLimit($userIdentifier, $rateLimitFile, 10, 60)) {
         http_response_code(429);
@@ -510,45 +673,41 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
     }
     
     $newContent = $_POST['content'];
-    
-    // Check if this is a NEW page (doesn't exist yet)
     $isNewPage = !file_exists("$pagesDir/$pageSafe.md");
     
-    // Atomic write
-    $tempFile = "$pagesDir/$pageSafe.md.tmp." . bin2hex(random_bytes(8));
-    $result = file_put_contents($tempFile, $newContent, LOCK_EX);
+    // Save current content as revision (if page exists and content changed)
+    if (!$isNewPage) {
+        $currentContent = file_get_contents("$pagesDir/$pageSafe.md");
+        if ($currentContent !== false && $currentContent !== $newContent) {
+            $username = $_SESSION['user'] ?? 'unknown';
+            saveRevision($pageSafe, $currentContent, $username);
+        }
+    }
+    
+    // Write new content
+    $result = file_put_contents("$pagesDir/$pageSafe.md", $newContent, LOCK_EX);
     
     if ($result === false) {
-        logMessage("Failed to write temp file: $tempFile", 'ERROR', $logFile);
+        logMessage("Failed to save file: $pagesDir/$pageSafe.md", 'ERROR', $logFile);
         http_response_code(500);
         die("Error: Failed to save the file.");
     }
     
-    chmod($tempFile, 0644);
+    chmod("$pagesDir/$pageSafe.md", 0644);
     
-    if (!rename($tempFile, "$pagesDir/$pageSafe.md")) {
-        logMessage("Failed to rename temp file to: $pagesDir/$pageSafe.md", 'ERROR', $logFile);
-        if (file_exists($tempFile)) {
-            unlink($tempFile);
-        }
-        http_response_code(500);
-        die("Error: Failed to save the file.");
-    }
-    
-    // Save metadata (who edited and when)
+    // Save metadata
     $username = $_SESSION['user'] ?? 'unknown';
     savePageMetadata("$pagesDir/$pageSafe.md", $username);
     
-    // Clear cache for this page
+    // Clear cache
     clearPageCache($pageSafe);
     
-    // If this is a NEW page, clear ALL caches to rebuild auto-links
     if ($isNewPage) {
         clearAllPageCaches();
-        logMessage("New page created: $pageSafe - cleared all caches for auto-link rebuild", 'INFO', $logFile);
+        logMessage("New page created: $pageSafe - cleared all caches", 'INFO', $logFile);
     }
     
-    // Rebuild search index in background (mark for rebuild)
+    // Rebuild search index
     touch(CACHE_DIR . '/.rebuild_index');
     
     logMessage("Page saved: $pageSafe by user: $username", 'INFO', $logFile);
@@ -560,14 +719,12 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
 // --- Handle image upload with rate limiting ---
 $uploadMessage = '';
 if (isset($_FILES['image']['tmp_name']) && is_uploaded_file($_FILES['image']['tmp_name'])) {
-    // CSRF validation
     if (!validateCsrfToken($_POST['csrf'] ?? '')) {
         logMessage("CSRF token mismatch on image upload", 'WARNING', $logFile);
         http_response_code(403);
         die("Security error: Invalid request");
     }
 
-    // Rate limit uploads per user
     $userIdentifier = 'upload_' . ($_SESSION['user'] ?? 'unknown');
     if (!checkRateLimit($userIdentifier, $rateLimitFile, 10, 60)) {
         http_response_code(429);
@@ -601,34 +758,31 @@ $searchTotalPages = 1;
 if (isset($_GET['search']) && !empty($_GET['q'])) {
     $q = $_GET['q'];
     
-    // Validate length
     if (strlen($q) > MAX_SEARCH_LENGTH) {
         http_response_code(400);
         die("Search query too long");
     }
     
-    // Rate limit searches per user
     $userIdentifier = 'search_' . ($_SESSION['user'] ?? 'unknown');
     if (!checkRateLimit($userIdentifier, $rateLimitFile, 20, 60)) {
         http_response_code(429);
         die("Too many search requests. Please wait a moment.");
     }
     
-    // Use indexed search (get all results first)
     $allSearchSnippets = searchWithIndex($q, $pagesDir);
     $searchTotalResults = count($allSearchSnippets);
     
-    // Pagination for search results
     $searchPage = isset($_GET['searchpage']) ? max(1, (int)$_GET['searchpage']) : 1;
     $searchTotalPages = ceil($searchTotalResults / SEARCH_RESULTS_PER_PAGE);
-    $searchPage = min($searchPage, max(1, $searchTotalPages)); // Ensure valid page
+    $searchPage = min($searchPage, max(1, $searchTotalPages));
     
     $offset = ($searchPage - 1) * SEARCH_RESULTS_PER_PAGE;
     $searchSnippets = array_slice($allSearchSnippets, $offset, SEARCH_RESULTS_PER_PAGE, true);
     $searchResults = array_keys($searchSnippets);
 }
+
 // --- Main page rendering ---
-renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEditing, $content, $page, $pageSafe, $pagesDir, $enableAutoLink, $uploadMessage, $nonce) {
+renderPage($page, function() use ($error, $searchResults, $searchSnippets, $searchTotalResults, $searchPage, $searchTotalPages, $isEditing, $content, $page, $pageSafe, $pagesDir, $enableAutoLink, $uploadMessage, $nonce) {
     if (!empty($error)): ?>
         <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
     <?php endif;
@@ -667,7 +821,7 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
             <?php endif; ?>
         </div>
     <?php endif; ?>
-        </ul>
+    
     <?php elseif ($isEditing): ?>
         <h2>Editing: <?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></h2>
         <form method="post" enctype="multipart/form-data" id="editForm">
@@ -687,9 +841,14 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
             <a href="?page=<?= urlencode($page) ?>"><button type="button">Cancel</button></a>
         </form>
     <?php else: ?>
+        <?php if (isset($_GET['restored'])): ?>
+            <div style="padding: 10px; background-color: #d4edda; color: #155724; border-radius: 4px; margin-bottom: 1em;">
+                ✓ Previous revision restored successfully!
+            </div>
+        <?php endif; ?>
+        
         <h1><?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></h1>
         <?php
-        // Try to get cached HTML
         $cachedHtml = getCachedHtml($page, $content);
         
         if ($cachedHtml !== null) {
@@ -697,8 +856,6 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
         } else {
             $html = parseMarkdownWithAutoLink($content, $pagesDir, $page, $enableAutoLink);
             echo '<div>' . $html . '</div>';
-            
-            // Cache the parsed HTML
             setCachedHtml($page, $content, $html);
         }
         ?>
@@ -706,7 +863,12 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $isEd
         <div style="clear: both;"></div>
         
         <?php if ($_SESSION['loggedin'] ?? false): ?>
-            <p><a href="?page=<?= urlencode($page) ?>&edit=1">Edit this page</a></p>
+            <p>
+                <a href="?page=<?= urlencode($page) ?>&edit=1">Edit this page</a>
+                <?php if (!empty($content)): ?>
+                    | <a href="?page=<?= urlencode($page) ?>&history=1">📜 View history</a>
+                <?php endif; ?>
+            </p>
         <?php endif; ?>
        
         <?php

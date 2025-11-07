@@ -473,3 +473,14 @@ function showImageHelp() {
           'Combine them:\n' +
           '![alt](url){.left .small}');
 }
+
+document.addEventListener('DOMContentLoaded', function() {
+    const restoreForms = document.querySelectorAll('.restore-form');
+    restoreForms.forEach(form => {
+        form.addEventListener('submit', function(event) {
+            if (!confirm('Restore this version? Current content will be saved as a new revision.')) {
+                event.preventDefault();
+            }
+        });
+    });
+});

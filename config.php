@@ -12,11 +12,11 @@ return [
     
     'sessions_dir' => __DIR__ . '/sessions',
     
-    'users_file' => __DIR__ . '/users.json',
+    'users_file' => __DIR__ . '/users.json.php',  // CHANGED: Added .php extension
     
-    'rate_limit_file' => __DIR__ . '/rate_limits.json',
+    'rate_limit_file' => __DIR__ . '/rate_limits.json.php',  // CHANGED: Added .php extension
     
-    'log_file' => __DIR__ . '/wiki.log',
+    'log_file' => __DIR__ . '/wikilog.php',
     
     'cache_dir' => __DIR__ . '/cache',
     

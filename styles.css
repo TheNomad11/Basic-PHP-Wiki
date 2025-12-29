@@ -539,6 +539,43 @@ pre code {
     font-size: 0.9em;
 }
 
+/* Manage Pages Table - NEW */
+.manage-pages-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1em 0;
+}
+
+.manage-pages-table th,
+.manage-pages-table td {
+    border: 1px solid #ddd;
+    padding: 0.8em;
+    text-align: left;
+}
+
+.manage-pages-table th {
+    background-color: #f0f0f0;
+    font-weight: bold;
+}
+
+.manage-pages-table tr:hover {
+    background-color: #f9f9f9;
+}
+
+.manage-pages-table button[name="delete_page"] {
+    background-color: #dc3545;
+    color: white;
+    border: none;
+    padding: 0.4em 0.8em;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9em;
+}
+
+.manage-pages-table button[name="delete_page"]:hover {
+    background-color: #c82333;
+}
+
 /* Responsive Design */
 @media (max-width: 600px) {
     body {
@@ -639,12 +676,14 @@ pre code {
     }
     
     .revisions-table,
-    .recent-changes {
+    .recent-changes,
+    .manage-pages-table {
         font-size: 0.9em;
     }
     
     .revisions-table td,
-    .recent-changes td {
+    .recent-changes td,
+    .manage-pages-table td {
         padding: 0.5em;
     }
     

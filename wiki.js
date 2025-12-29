@@ -1,20 +1,22 @@
 // wiki.js - External JavaScript file for the wiki with improved auto-save
 
 // Auto-save configuration
-const AUTO_SAVE_DELAY = 5000; // 5 seconds (increased from 2)
+const AUTO_SAVE_DELAY = 5000; // 5 seconds
 const AUTO_SAVE_MIN_CHANGES = 10; // Minimum characters changed before saving
 
 // Auto-save state
 let autoSaveTimer = null;
 let lastSavedContent = '';
 let lastCheckedContent = '';
-let saveInProgress = false;
+let saveInProgress = false; // FIXED: Prevent concurrent saves
 
 // Test localStorage availability immediately
+let localStorageAvailable = false;
 try {
     const test = 'test';
     localStorage.setItem('test', test);
     localStorage.removeItem('test');
+    localStorageAvailable = true;
     console.log('localStorage is available');
 } catch (e) {
     console.error('localStorage is NOT available:', e);
@@ -73,6 +75,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // Initialize auto-save functionality
 function initAutoSave() {
+    if (!localStorageAvailable) {
+        console.log('Auto-save disabled: localStorage not available');
+        return;
+    }
+    
     const editbox = document.getElementById('editbox');
     if (!editbox) {
         console.log('Cannot initialize auto-save: editbox not found');
@@ -157,15 +164,20 @@ function initAutoSave() {
     setInterval(function() {
         const pageName = getPageName();
         const draftKey = 'wiki_draft_' + pageName;
-        const draftTimestamp = localStorage.getItem(draftKey + '_time');
         
-        if (draftTimestamp) {
-            const saveTime = new Date(parseInt(draftTimestamp));
-            const timeStr = saveTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            const statusDiv = document.getElementById('save-status');
-            if (statusDiv && statusDiv.textContent.includes('Draft saved')) {
-                statusDiv.textContent = '✓ Draft saved at ' + timeStr;
+        try {
+            const draftTimestamp = localStorage.getItem(draftKey + '_time');
+            
+            if (draftTimestamp) {
+                const saveTime = new Date(parseInt(draftTimestamp));
+                const timeStr = saveTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                const statusDiv = document.getElementById('save-status');
+                if (statusDiv && statusDiv.textContent.includes('Draft saved')) {
+                    statusDiv.textContent = '✓ Draft saved at ' + timeStr;
+                }
             }
+        } catch (e) {
+            console.error('Error updating status:', e);
         }
     }, 60000);
     
@@ -280,8 +292,18 @@ function showStatus(message, type) {
     }, 3000);
 }
 
-// Save draft to localStorage
+// Save draft to localStorage - FIXED: Race condition protection
 function saveDraft(synchronous = false) {
+    if (!localStorageAvailable) {
+        return;
+    }
+    
+    // FIXED: Prevent concurrent saves
+    if (saveInProgress && !synchronous) {
+        console.log('Save already in progress, skipping');
+        return;
+    }
+    
     const editbox = document.getElementById('editbox');
     if (!editbox) return;
     
@@ -295,6 +317,8 @@ function saveDraft(synchronous = false) {
     
     console.log('Saving draft...');
     updateStatus('saving');
+    
+    saveInProgress = true;
     
     try {
         const pageName = getPageName();
@@ -319,6 +343,8 @@ function saveDraft(synchronous = false) {
         if (e.name === 'QuotaExceededError') {
             alert('Storage quota exceeded. Please clear some old drafts or reduce content size.');
         }
+    } finally {
+        saveInProgress = false;
     }
 }
 
@@ -474,6 +500,7 @@ function showImageHelp() {
           '![alt](url){.left .small}');
 }
 
+// Handle restore revision confirmation
 document.addEventListener('DOMContentLoaded', function() {
     const restoreForms = document.querySelectorAll('.restore-form');
     restoreForms.forEach(form => {

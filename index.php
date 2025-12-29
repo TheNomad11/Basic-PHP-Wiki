@@ -7,11 +7,8 @@ $config = require __DIR__ . '/config.php';
 // Include functions
 require_once __DIR__ . '/functions.php';
 
-
 // Protection layer
 require_once __DIR__ . '/protect.php';
-
-
 
 // --- Start session with hardened settings ---
 if (session_status() !== PHP_SESSION_ACTIVE) {
@@ -39,6 +36,25 @@ if (!isset($_SESSION['init'])) {
     session_regenerate_id(true);
     $_SESSION['init'] = true;
     $_SESSION['created'] = time();
+}
+
+// SECURITY: Session fingerprinting to prevent hijacking
+if (empty($_SESSION['user_agent'])) {
+    $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'] ?? '';
+} elseif ($_SESSION['user_agent'] !== ($_SERVER['HTTP_USER_AGENT'] ?? '')) {
+    session_unset();
+    session_destroy();
+    clearSessionCookie();
+    logMessage("Session hijacking attempt detected", 'WARNING', LOG_FILE);
+    die("Security error: Invalid session");
+}
+
+// SECURITY: Regenerate session ID periodically (every 15 minutes)
+if (!isset($_SESSION['last_regeneration'])) {
+    $_SESSION['last_regeneration'] = time();
+} elseif (time() - $_SESSION['last_regeneration'] > 900) {
+    session_regenerate_id(true);
+    $_SESSION['last_regeneration'] = time();
 }
 
 // Generate CSP nonce
@@ -69,8 +85,8 @@ if (!is_dir($pagesDir)) {
     
     $indexFile = $pagesDir . '/Home.md';
     if (!file_exists($indexFile)) {
-        file_put_contents($indexFile, "# Welcome to Simple Wiki\n\nEdit this page to get started.", LOCK_EX);
-        chmod($indexFile, 0644);
+        @file_put_contents($indexFile, "# Welcome to Simple Wiki\n\nEdit this page to get started.", LOCK_EX);
+        @chmod($indexFile, 0644);
     }
 }
 
@@ -85,7 +101,7 @@ if (!is_dir(CACHE_DIR)) {
 $rebuildMarker = CACHE_DIR . '/.rebuild_index';
 if (file_exists($rebuildMarker)) {
     buildSearchIndex($pagesDir);
-    unlink($rebuildMarker);
+    @unlink($rebuildMarker);
 }
 
 // Session timeout (absolute timeout)
@@ -108,10 +124,14 @@ if (isset($_SESSION['loggedin']) && isset($_SESSION['last_activity'])) {
         header("Location: index.php");
         exit;
     }
+}
+
+// Update activity timestamp
+if (isset($_SESSION['loggedin'])) {
     $_SESSION['last_activity'] = time();
 }
 
-// Load users - UPDATED to use new function
+// Load users
 $users = loadUsersFile($usersFile);
 if (!empty($users)) {
     $invalid = validateUserPasswords($usersFile);
@@ -120,7 +140,7 @@ if (!empty($users)) {
     }
 }
 
-// --- Handle login with rate limiting ---
+// --- Handle login with rate limiting and timing attack protection ---
 $error = '';
 if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['password'])) {
     if (!validateCsrfToken($_POST['csrf'] ?? '')) {
@@ -144,11 +164,16 @@ if (isset($_POST['login']) && !empty($_POST['username']) && !empty($_POST['passw
         logMessage("Invalid username format attempted: $username from IP: $clientIp", 'WARNING', $logFile);
         recordFailedAttempt($clientIp, $rateLimitFile);
     } else {
-        if (isset($users[$username]) && password_verify($_POST['password'], $users[$username])) {
+        // SECURITY: Prevent timing attacks by always calling password_verify
+        $hash = $users[$username] ?? '$2y$10$dummyhashtopreventtimingattack.................................................';
+        $valid = password_verify($_POST['password'], $hash);
+        
+        if ($valid && isset($users[$username])) {
             session_regenerate_id(true);
             $_SESSION['loggedin'] = true;
             $_SESSION['user'] = $username;
             $_SESSION['last_activity'] = time();
+            $_SESSION['login_time'] = time();
             resetRateLimit($clientIp, $rateLimitFile);
             logMessage("Successful login: $username from IP: $clientIp", 'INFO', $logFile);
             header("Location: index.php");
@@ -176,6 +201,7 @@ if (isset($_GET['logout']) || isset($_POST['logout'])) {
     
     session_unset();
     session_destroy();
+    session_regenerate_id(true);
     clearSessionCookie();
     
     header("Location: index.php");
@@ -213,34 +239,95 @@ if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
 
 // --- User is logged in - process wiki operations ---
 
-// Determine current page with length validation
+// SECURITY: Validate page name with improved function
 $page = $_GET['page'] ?? $defaultPage;
 
 if (strlen($page) > MAX_PAGE_NAME_LENGTH) {
     logMessage("Page name too long: " . strlen($page) . " chars", 'WARNING', $logFile);
-    $page = $defaultPage;
+    
+    renderPage('Error', function() use ($page, $defaultPage) {
+        ?>
+        <h1>Invalid Page Name</h1>
+        <div class="error">
+            <p><strong>Error:</strong> Page name is too long (maximum <?= MAX_PAGE_NAME_LENGTH ?> characters).</p>
+            <p>The page name you entered: <code><?= htmlspecialchars(substr($page, 0, 150), ENT_QUOTES, 'UTF-8') ?></code></p>
+        </div>
+        <p><a href="?page=<?= urlencode($defaultPage) ?>">← Go to Home</a></p>
+        <?php
+    }, $nonce);
+    exit;
 }
 
-$pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $page);
+$originalPage = $page;
+$pageSafe = validatePageName($page);
 
-if (empty($pageSafe)) {
-    $pageSafe = $defaultPage;
+if ($pageSafe === null) {
+    logMessage("Invalid page name rejected: " . substr($originalPage, 0, 100), 'WARNING', $logFile);
+    
+    renderPage('Error', function() use ($originalPage, $defaultPage) {
+        ?>
+        <h1>Invalid Page Name</h1>
+        <div class="error">
+            <p><strong>Error:</strong> The page name contains invalid characters or is empty.</p>
+            <p>Page names can only contain:</p>
+            <ul>
+                <li>Letters (any language)</li>
+                <li>Numbers</li>
+                <li>Spaces</li>
+                <li>Hyphens (-)</li>
+                <li>Underscores (_)</li>
+            </ul>
+            <p>You tried to access: <code><?= htmlspecialchars($originalPage, ENT_QUOTES, 'UTF-8') ?></code></p>
+        </div>
+        <p><a href="?page=<?= urlencode($defaultPage) ?>">← Go to Home</a></p>
+        <?php
+    }, $nonce);
+    exit;
 }
 
-// Directory traversal protection
+// Check for dangerous patterns
+if ($pageSafe !== $originalPage && !empty($originalPage)) {
+    $dangerous = false;
+    if (strpos($originalPage, '..') !== false || 
+        strpos($originalPage, '/') !== false || 
+        strpos($originalPage, '\\') !== false ||
+        strpos($originalPage, "\0") !== false) {
+        $dangerous = true;
+    }
+    
+    if ($dangerous) {
+        logMessage("Security threat detected in page name: " . substr($originalPage, 0, 100), 'WARNING', $logFile);
+        
+        renderPage('Error', function() use ($originalPage, $defaultPage) {
+            ?>
+            <h1>Security Error</h1>
+            <div class="error">
+                <p><strong>Security Warning:</strong> The page name contains potentially dangerous characters.</p>
+                <p>Your request has been logged for security purposes.</p>
+                <p>Attempted access: <code><?= htmlspecialchars($originalPage, ENT_QUOTES, 'UTF-8') ?></code></p>
+            </div>
+            <p><a href="?page=<?= urlencode($defaultPage) ?>">← Go to Home</a></p>
+            <?php
+        }, $nonce);
+        exit;
+    }
+}
+
+$page = $pageSafe;
+
+// SECURITY: Directory traversal protection
 $realBase = realpath($pagesDir);
 if ($realBase === false) {
     die("Configuration error: Pages directory not accessible");
 }
 
 $filePath = "$pagesDir/$pageSafe.md";
-if (file_exists($filePath)) {
-    $realFilePath = realpath($filePath);
-    if ($realFilePath === false || strpos($realFilePath, $realBase) !== 0) {
-        logMessage("Directory traversal attempt: $filePath", 'ERROR', $logFile);
-        http_response_code(403);
-        die("Security error: Invalid page request");
-    }
+
+// SECURITY: Additional validation before any file operation
+if (!validateFilePath($filePath, $pagesDir)) {
+    logMessage("Path traversal attempt: $filePath", 'ERROR', $logFile);
+    http_response_code(403);
+    die("Security error: Invalid path");
 }
 
 // --- Handle tag pages ---
@@ -263,11 +350,13 @@ if (isset($_GET['tag'])) {
     $files = glob("$pagesDir/*.md");
     if ($files !== false) {
         foreach ($files as $file) {
-            // Skip revision files
             if (strpos($file, '.md.rev.') !== false) {
                 continue;
             }
-            $content = file_get_contents($file);
+            if (!validateFilePath($file, $pagesDir)) {
+                continue;
+            }
+            $content = @file_get_contents($file);
             if ($content !== false && preg_match('/(^|\s)#' . preg_quote($tag, '/') . '(\s|$)/', $content)) {
                 $results[] = basename($file, ".md");
             }
@@ -311,8 +400,8 @@ if ($pageSafe === 'AllTags') {
     exit;
 }
 
-// --- Handle cache clearing ---
-if (isset($_GET['action']) && $_GET['action'] === 'clearcache') {
+// --- Handle cache clearing (POST only for CSRF protection) ---
+if (isset($_POST['action']) && $_POST['action'] === 'clearcache') {
     if (!validateCsrfToken($_POST['csrf'] ?? '')) {
         logMessage("CSRF token mismatch on cache clear", 'WARNING', $logFile);
         http_response_code(403);
@@ -338,7 +427,9 @@ if ($pageSafe === 'AllPages') {
     $paginatedPages = array_slice($allPages, $offset, PAGES_PER_PAGE);
     $totalPageCount = ceil($totalPages / PAGES_PER_PAGE);
     
-    renderPage('All Pages', function() use ($paginatedPages, $pageNum, $totalPageCount, $totalPages) {
+    $protectedPages = ['Home', 'AllPages', 'AllTags', 'RecentChanges'];
+    
+    renderPage('All Pages', function() use ($paginatedPages, $pageNum, $totalPageCount, $totalPages, $protectedPages) {
         ?>
         <h1>All Pages</h1>
         
@@ -348,17 +439,26 @@ if ($pageSafe === 'AllPages') {
             </div>
         <?php endif; ?>
         
-        <p>Showing <?= count($paginatedPages) ?> of <?= $totalPages ?> pages</p>
+        <p>
+            Showing <?= count($paginatedPages) ?> of <?= $totalPages ?> pages
+            <span style="color: #666; margin-left: 1em;">🔒 = Protected (cannot be deleted)</span>
+        </p>
         
-        <form method="post" action="?action=clearcache" style="margin-bottom: 1em;">
+        <form method="post" style="margin-bottom: 1em;">
             <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="action" value="clearcache">
             <button type="submit" style="background-color: #6c757d;">🔄 Rebuild All Links</button>
             <small style="color: #666; margin-left: 0.5em;">Use this if auto-links aren't working after creating new pages</small>
         </form>
         
         <ul>
             <?php foreach ($paginatedPages as $p): ?>
-                <li><a href="?page=<?= urlencode($p) ?>"><?= htmlspecialchars($p, ENT_QUOTES, 'UTF-8') ?></a></li>
+                <li>
+                    <a href="?page=<?= urlencode($p) ?>"><?= htmlspecialchars($p, ENT_QUOTES, 'UTF-8') ?></a>
+                    <?php if (in_array($p, $protectedPages)): ?>
+                        <span style="color: #666; font-size: 0.9em;">🔒</span>
+                    <?php endif; ?>
+                </li>
             <?php endforeach; ?>
         </ul>
         
@@ -380,6 +480,102 @@ if ($pageSafe === 'AllPages') {
     exit;
 }
 
+// ========== END OF PART 1 ==========
+// Continue with PART 2...
+// ========== PART 2 - Continue from Part 1 ==========
+
+// ========== PART 2 - Continue from Part 1 ==========
+
+// --- Handle page deletion ---
+if (isset($_POST['delete_page']) && isset($_POST['page'])) {
+    if (!validateCsrfToken($_POST['csrf'] ?? '')) {
+        logMessage("CSRF token mismatch on page deletion", 'WARNING', $logFile);
+        http_response_code(403);
+        die("Security error: Invalid request");
+    }
+    
+    $pageName = $_POST['page'];
+    
+    if (strlen($pageName) > MAX_PAGE_NAME_LENGTH) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
+    $pageSafe = validatePageName($pageName);
+    if ($pageSafe === null) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
+    if (!isset($_POST['confirm_delete']) || $_POST['confirm_delete'] !== 'yes') {
+        http_response_code(400);
+        die("Deletion not confirmed");
+    }
+    
+    $username = $_SESSION['user'] ?? 'unknown';
+    
+    if (deletePage($pageSafe, $username)) {
+        logMessage("Page deleted: $pageSafe by user: $username", 'INFO', $logFile);
+        header("Location: index.php?deleted=1");
+        exit;
+    } else {
+        logMessage("Failed to delete page: $pageSafe", 'ERROR', $logFile);
+        http_response_code(500);
+        die("Failed to delete page. Check the error log for details.");
+    }
+}
+
+// --- Handle "Manage Pages" interface ---
+if (isset($_GET['manage']) && $_GET['manage'] === 'pages') {
+    $deletablePages = getDeletablePages($pagesDir);
+    
+    renderPage('Manage Pages', function() use ($deletablePages) {
+        ?>
+        <h1>Manage Pages</h1>
+        
+        <div style="background-color: #fff3cd; padding: 1em; border-radius: 4px; margin-bottom: 1em;">
+            <strong>⚠️ Warning:</strong> Deleting a page is permanent. A final revision will be saved before deletion.
+        </div>
+        
+        <p>
+            Protected pages (Home, AllPages, AllTags, RecentChanges) cannot be deleted.<br>
+            <a href="index.php">← Back to Home</a>
+        </p>
+        
+        <?php if (empty($deletablePages)): ?>
+            <p>No pages available for deletion. Only the Home page exists.</p>
+        <?php else: ?>
+            <table class="manage-pages-table">
+                <thead>
+                    <tr>
+                        <th>Page Name</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($deletablePages as $page): ?>
+                        <tr>
+                            <td>
+                                <a href="?page=<?= urlencode($page) ?>"><?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?></a>
+                            </td>
+                            <td>
+                                <form method="post" style="display: inline;" onsubmit="return confirm('Are you sure you want to delete &quot;<?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?>&quot;?\n\nThis action cannot be undone!');">
+                                    <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                                    <input type="hidden" name="page" value="<?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?>">
+                                    <input type="hidden" name="confirm_delete" value="yes">
+                                    <button type="submit" name="delete_page" style="background-color: #dc3545; color: white;">🗑️ Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+        <?php
+    }, $nonce);
+    exit;
+}
+
 // --- Handle revision history ---
 if (isset($_GET['history'])) {
     $pageName = $_GET['page'] ?? $defaultPage;
@@ -389,9 +585,10 @@ if (isset($_GET['history'])) {
         die("Invalid page name");
     }
     
-    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
-    if (empty($pageSafe)) {
-        $pageSafe = $defaultPage;
+    $pageSafe = validatePageName($pageName);
+    if ($pageSafe === null) {
+        http_response_code(400);
+        die("Invalid page name");
     }
     
     $revisions = getRevisions($pageSafe);
@@ -425,17 +622,12 @@ if (isset($_GET['history'])) {
                                     | <a href="?page=<?= urlencode($pageSafe) ?>&diff=<?= $rev['timestamp'] ?>&oldrev=<?= $revisions[$i + 1]['timestamp'] ?>">Diff</a>
                                 <?php endif; ?>
                                 | 
-                              
-<form method="post"
-      action="index.php?page=<?= urlencode($pageSafe) ?>"   
-      style="display: inline;"
-      onsubmit="return confirm('Restore this version? Current content will be saved as a revision.');">
-    <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
-    <input type="hidden" name="restore_revision" value="<?= $rev['timestamp'] ?>">
-    <input type="hidden" name="page" value="<?= htmlspecialchars($pageSafe, ENT_QUOTES, 'UTF-8') ?>">
-    <button type="submit" style="background: none; border: none; color: #0066cc; text-decoration: underline; cursor: pointer; padding: 0; font-size: inherit;">Restore</button>
-</form>
-                                   
+                                <form method="post" action="index.php?page=<?= urlencode($pageSafe) ?>" style="display: inline;" onsubmit="return confirm('Restore this version? Current content will be saved as a revision.');">
+                                    <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                                    <input type="hidden" name="restore_revision" value="<?= $rev['timestamp'] ?>">
+                                    <input type="hidden" name="page" value="<?= htmlspecialchars($pageSafe, ENT_QUOTES, 'UTF-8') ?>">
+                                    <button type="submit" style="background: none; border: none; color: #0066cc; text-decoration: underline; cursor: pointer; padding: 0; font-size: inherit;">Restore</button>
+                                </form>
                             </td>
                         </tr>
                     <?php endforeach; ?>
@@ -457,7 +649,12 @@ if (isset($_GET['viewrev'])) {
         die("Invalid page name");
     }
     
-    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
+    $pageSafe = validatePageName($pageName);
+    if ($pageSafe === null) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
     $revisionContent = getRevisionContent($pageSafe, $timestamp);
     
     if ($revisionContent === null) {
@@ -498,7 +695,12 @@ if (isset($_GET['diff'])) {
         die("Invalid page name");
     }
     
-    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
+    $pageSafe = validatePageName($pageName);
+    if ($pageSafe === null) {
+        http_response_code(400);
+        die("Invalid page name");
+    }
+    
     $newContent = getRevisionContent($pageSafe, $newTimestamp);
     $oldContent = getRevisionContent($pageSafe, $oldTimestamp);
     
@@ -567,9 +769,10 @@ if (isset($_POST['restore_revision']) && isset($_POST['page'])) {
         die("Invalid page name");
     }
     
-    $pageSafe = preg_replace('/[^\p{L}0-9 _\-]/u', '', $pageName);
-    if (empty($pageSafe)) {
-        $pageSafe = $defaultPage;
+    $pageSafe = validatePageName($pageName);
+    if ($pageSafe === null) {
+        http_response_code(400);
+        die("Invalid page name");
     }
     
     $username = $_SESSION['user'] ?? 'unknown';
@@ -637,7 +840,14 @@ function formatTimeAgo(int $timestamp): string
 
 // --- File handling ---
 $file = "$pagesDir/$pageSafe.md";
-$content = file_exists($file) ? file_get_contents($file) : '';
+
+if (!validateFilePath($file, $pagesDir)) {
+    logMessage("Invalid file path: $file", 'ERROR', $logFile);
+    http_response_code(403);
+    die("Security error: Invalid path");
+}
+
+$content = file_exists($file) ? @file_get_contents($file) : '';
 if ($content === false) {
     $content = '';
 }
@@ -672,17 +882,21 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
     $newContent = $_POST['content'];
     $isNewPage = !file_exists("$pagesDir/$pageSafe.md");
     
-    // Save current content as revision (if page exists and content changed)
+    if (!validateFilePath("$pagesDir/$pageSafe.md", $pagesDir)) {
+        logMessage("Invalid file path on save: $pagesDir/$pageSafe.md", 'ERROR', $logFile);
+        http_response_code(403);
+        die("Security error: Invalid path");
+    }
+    
     if (!$isNewPage) {
-        $currentContent = file_get_contents("$pagesDir/$pageSafe.md");
+        $currentContent = @file_get_contents("$pagesDir/$pageSafe.md");
         if ($currentContent !== false && $currentContent !== $newContent) {
             $username = $_SESSION['user'] ?? 'unknown';
             saveRevision($pageSafe, $currentContent, $username);
         }
     }
     
-    // Write new content
-    $result = file_put_contents("$pagesDir/$pageSafe.md", $newContent, LOCK_EX);
+    $result = @file_put_contents("$pagesDir/$pageSafe.md", $newContent, LOCK_EX);
     
     if ($result === false) {
         logMessage("Failed to save file: $pagesDir/$pageSafe.md", 'ERROR', $logFile);
@@ -690,13 +904,11 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
         die("Error: Failed to save the file.");
     }
     
-    chmod("$pagesDir/$pageSafe.md", 0644);
+    @chmod("$pagesDir/$pageSafe.md", 0644);
     
-    // Save metadata
     $username = $_SESSION['user'] ?? 'unknown';
     savePageMetadata("$pagesDir/$pageSafe.md", $username);
     
-    // Clear cache
     clearPageCache($pageSafe);
     
     if ($isNewPage) {
@@ -704,8 +916,7 @@ if ($isEditing && isset($_POST['content']) && isset($_POST['save'])) {
         logMessage("New page created: $pageSafe - cleared all caches", 'INFO', $logFile);
     }
     
-    // Rebuild search index
-    touch(CACHE_DIR . '/.rebuild_index');
+    @touch(CACHE_DIR . '/.rebuild_index');
     
     logMessage("Page saved: $pageSafe by user: $username", 'INFO', $logFile);
     
@@ -782,6 +993,12 @@ if (isset($_GET['search']) && !empty($_GET['q'])) {
 renderPage($page, function() use ($error, $searchResults, $searchSnippets, $searchTotalResults, $searchPage, $searchTotalPages, $isEditing, $content, $page, $pageSafe, $pagesDir, $enableAutoLink, $uploadMessage, $nonce) {
     if (!empty($error)): ?>
         <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endif;
+
+    if (isset($_GET['deleted'])): ?>
+        <div style="padding: 10px; background-color: #d4edda; color: #155724; border-radius: 4px; margin-bottom: 1em;">
+            ✓ Page deleted successfully!
+        </div>
     <?php endif;
 
     if (!empty($searchResults)): ?>
@@ -861,9 +1078,21 @@ renderPage($page, function() use ($error, $searchResults, $searchSnippets, $sear
         
         <?php if ($_SESSION['loggedin'] ?? false): ?>
             <p>
-                <a href="?page=<?= urlencode($page) ?>&edit=1">Edit this page</a>
+                <a href="?page=<?= urlencode($page) ?>&edit=1">✏️ Edit this page</a>
                 <?php if (!empty($content)): ?>
                     | <a href="?page=<?= urlencode($page) ?>&history=1">📜 View history</a>
+                <?php endif; ?>
+                <?php 
+                $protectedPages = ['Home', 'AllPages', 'AllTags', 'RecentChanges'];
+                if (!in_array($page, $protectedPages)): 
+                ?>
+                    | 
+                    <form method="post" style="display: inline;" onsubmit="return confirm('Are you sure you want to delete this page?\n\nThis action cannot be undone!');">
+                        <input type="hidden" name="csrf" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+                        <input type="hidden" name="page" value="<?= htmlspecialchars($page, ENT_QUOTES, 'UTF-8') ?>">
+                        <input type="hidden" name="confirm_delete" value="yes">
+                        <button type="submit" name="delete_page" style="background: none; border: none; color: #dc3545; text-decoration: underline; cursor: pointer; padding: 0; font-size: inherit;">🗑️ Delete page</button>
+                    </form>
                 <?php endif; ?>
             </p>
         <?php endif; ?>

@@ -34,9 +34,36 @@ require_once 'Parsedown.php';
 $_pageNamesCache = null;
 $_pageNamesCacheTime = 0;
 
-// -----------------------------
-// Utility: Logging
-// -----------------------------
+function validatePageName(string $pageName): ?string
+{
+    $pageName = str_replace(['/', '\\', "\0"], '', $pageName);
+    $pageName = str_replace(['..', '~'], '', $pageName);
+    $pageName = preg_replace('/[^\p{L}\p{N} _\-]/u', '', $pageName);
+    $pageName = preg_replace('/\s+/', ' ', trim($pageName));
+    if (strlen($pageName) > MAX_PAGE_NAME_LENGTH || strlen($pageName) < 1) {
+        return null;
+    }
+    return $pageName;
+}
+
+function validateFilePath(string $filePath, string $baseDir): bool
+{
+    $realBase = realpath($baseDir);
+    if ($realBase === false) {
+        return false;
+    }
+    if (!file_exists($filePath)) {
+        $parentDir = dirname($filePath);
+        if (!file_exists($parentDir)) {
+            $parentDir = $baseDir;
+        }
+        $realPath = realpath($parentDir);
+    } else {
+        $realPath = realpath($filePath);
+    }
+    return $realPath !== false && strpos($realPath, $realBase) === 0;
+}
+
 function logMessage(string $message, string $level = 'INFO', string $logFile = LOG_FILE): bool
 {
     if (empty($logFile)) {
@@ -51,7 +78,7 @@ function logMessage(string $message, string $level = 'INFO', string $logFile = L
             return false;
         }
     }
-    $fh = fopen($logFile, 'a');
+    $fh = @fopen($logFile, 'a');
     if ($fh === false) {
         return false;
     }
@@ -66,9 +93,6 @@ function logMessage(string $message, string $level = 'INFO', string $logFile = L
     return $success;
 }
 
-// -----------------------------
-// Utility: safe client IP
-// -----------------------------
 function getClientIp(): string
 {
     if (TRUST_PROXY) {
@@ -89,35 +113,20 @@ function getClientIp(): string
     return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
 }
 
-// -----------------------------
-// NEW: Protected JSON file helpers
-// -----------------------------
-/**
-/**
- * Read JSON file, stripping PHP protection header if present
- */
 function readProtectedJsonFile(string $file): array
 {
     if (!file_exists($file)) {
         return [];
     }
-
-    $content = file_get_contents($file);
+    $content = @file_get_contents($file);
     if ($content === false) {
         return [];
     }
-
-    // Strip PHP protection header if present
     $content = preg_replace('/^<\?php[^?]*\?>\s*/s', '', $content);
-
     $data = json_decode($content, true);
     return is_array($data) ? $data : [];
 }
 
-
-/**
- * Write JSON file with PHP protection header
- */
 function writeProtectedJsonFile(string $file, array $data): bool
 {
     $dir = dirname($file);
@@ -127,54 +136,46 @@ function writeProtectedJsonFile(string $file, array $data): bool
             return false;
         }
     }
-    
     $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if ($json === false) {
+        logMessage("Failed to encode JSON for file: $file", 'ERROR');
+        return false;
+    }
     $protected = "<?php http_response_code(403); die('Access denied'); ?>\n" . $json;
-    
-    $result = file_put_contents($file, $protected, LOCK_EX);
+    $result = @file_put_contents($file, $protected, LOCK_EX);
     if ($result !== false) {
-        chmod($file, 0600);
+        @chmod($file, 0600);
         return true;
     }
+    logMessage("Failed to write protected JSON file: $file", 'ERROR');
     return false;
 }
 
-/**
- * Load users from JSON file with PHP protection support
- */
 function loadUsersFile(string $usersFile = USERS_FILE): array
 {
     if (!file_exists($usersFile)) {
         return [];
     }
-    
-    $content = file_get_contents($usersFile);
+    $content = @file_get_contents($usersFile);
     if ($content === false) {
         logMessage("Failed to read users file: $usersFile", 'ERROR');
         return [];
     }
-    
-    // Strip PHP protection header if present
     $content = preg_replace('/^<\?php[^?]*\?>\s*/s', '', $content);
-    
     $users = json_decode($content, true);
     if (!is_array($users)) {
         logMessage("Invalid users file format: $usersFile", 'ERROR');
         return [];
     }
-    
     return $users;
 }
 
-// -----------------------------
-// Atomic read/write helpers for JSON files (with locking) - UPDATED
-// -----------------------------
 function readJsonFileLocked(string $file): array
 {
     if (!file_exists($file)) {
         return [];
     }
-    $fh = fopen($file, 'r');
+    $fh = @fopen($file, 'r');
     if ($fh === false) {
         logMessage("Failed to open file for reading: $file", 'ERROR');
         return [];
@@ -183,7 +184,6 @@ function readJsonFileLocked(string $file): array
     if (flock($fh, LOCK_SH)) {
         $contents = stream_get_contents($fh);
         if ($contents !== false) {
-            // Strip PHP protection header if present
             $contents = preg_replace('/^<\?php[^?]*\?>\s*/s', '', $contents);
             $decoded = json_decode($contents, true);
             $data = is_array($decoded) ? $decoded : [];
@@ -203,43 +203,58 @@ function writeJsonFileLocked(string $file, array $data): bool
             return false;
         }
     }
-    $tmp = $file . '.tmp.' . bin2hex(random_bytes(8));
-    $fh = fopen($tmp, 'w');
-    if ($fh === false) {
-        logMessage("Failed to create temp file: $tmp", 'ERROR');
+    $tmp = $file . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+    $lockFile = $dir . '/.lock';
+    $lockFh = @fopen($lockFile, 'c');
+    if ($lockFh === false) {
+        logMessage("Failed to create lock file: $lockFile", 'ERROR');
         return false;
     }
-    $success = false;
-    if (flock($fh, LOCK_EX)) {
+    if (!flock($lockFh, LOCK_EX)) {
+        fclose($lockFh);
+        logMessage("Failed to acquire lock: $lockFile", 'ERROR');
+        return false;
+    }
+    try {
+        $fh = @fopen($tmp, 'w');
+        if ($fh === false) {
+            throw new Exception("Failed to create temp file: $tmp");
+        }
         $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        
-        // Add PHP protection header if filename ends with .php
+        if ($json === false) {
+            fclose($fh);
+            throw new Exception("Failed to encode JSON");
+        }
         if (substr($file, -4) === '.php') {
             $json = "<?php http_response_code(403); die('Access denied'); ?>\n" . $json;
         }
-        
-        $written = fwrite($fh, $json);
-        fflush($fh);
-        flock($fh, LOCK_UN);
-        if ($written !== false) {
-            $success = rename($tmp, $file);
-            if (!$success) {
-                logMessage("Failed to rename temp file to: $file", 'ERROR');
-            } else {
-                chmod($file, 0600);
-            }
+        if (fwrite($fh, $json) === false) {
+            fclose($fh);
+            throw new Exception("Failed to write to temp file");
         }
+        if (!fflush($fh)) {
+            fclose($fh);
+            throw new Exception("Failed to flush temp file");
+        }
+        fclose($fh);
+        if (!rename($tmp, $file)) {
+            throw new Exception("Failed to rename temp file to: $file");
+        }
+        @chmod($file, 0600);
+        flock($lockFh, LOCK_UN);
+        fclose($lockFh);
+        return true;
+    } catch (Exception $e) {
+        logMessage($e->getMessage(), 'ERROR');
+        if (file_exists($tmp)) {
+            @unlink($tmp);
+        }
+        flock($lockFh, LOCK_UN);
+        fclose($lockFh);
+        return false;
     }
-    fclose($fh);
-    if (!$success && file_exists($tmp)) {
-        unlink($tmp);
-    }
-    return $success;
 }
 
-// -----------------------------
-// Rate limit functions
-// -----------------------------
 function checkRateLimit(string $identifier, string $rateLimitFile = RATE_LIMIT_FILE, int $maxAttempts = RATE_MAX_ATTEMPTS, int $blockDuration = RATE_BLOCK_SECONDS): bool
 {
     $rateLimits = readJsonFileLocked($rateLimitFile);
@@ -286,84 +301,70 @@ function resetRateLimit(string $identifier, string $rateLimitFile = RATE_LIMIT_F
     writeJsonFileLocked($rateLimitFile, $rateLimits);
 }
 
-// -----------------------------
-// SIMPLIFIED Version History Functions
-// Revisions stored as: PageName.md.rev.TIMESTAMP
-// Same folder, markdown format, super simple!
-// -----------------------------
-
-/**
- * Save a revision of a page
- * Creates: pages/PageName.md.rev.1234567890
- */
 function saveRevision(string $pageName, string $content, string $user): bool
 {
-    $pagesDir = PAGES_DIR;
-    $timestamp = time();
-    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
-    
-    // Write the revision file (just the markdown content!)
-    $result = file_put_contents($revisionFile, $content, LOCK_EX);
-    
-    if ($result === false) {
-        logMessage("Failed to save revision for: $pageName", 'ERROR');
+    $validatedName = validatePageName($pageName);
+    if ($validatedName === null) {
+        logMessage("Invalid page name in saveRevision: $pageName", 'ERROR');
         return false;
     }
-    
-    chmod($revisionFile, 0644);
-    
-    // Save metadata in a companion file
+    $pagesDir = PAGES_DIR;
+    $timestamp = time();
+    $revisionFile = $pagesDir . '/' . $validatedName . '.md.rev.' . $timestamp;
+    if (!validateFilePath($revisionFile, $pagesDir)) {
+        logMessage("Invalid file path in saveRevision: $revisionFile", 'ERROR');
+        return false;
+    }
+    $result = @file_put_contents($revisionFile, $content, LOCK_EX);
+    if ($result === false) {
+        logMessage("Failed to save revision for: $validatedName", 'ERROR');
+        return false;
+    }
+    @chmod($revisionFile, 0644);
     $metaFile = $revisionFile . '.meta';
     $metadata = [
         'user' => $user,
         'timestamp' => $timestamp,
         'date' => date('Y-m-d H:i:s', $timestamp)
     ];
-    file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX);
-    chmod($metaFile, 0644);
-    
-    // Cleanup old revisions
-    cleanupOldRevisions($pageName);
-    
+    @file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX);
+    @chmod($metaFile, 0644);
+    cleanupOldRevisions($validatedName);
     return true;
 }
 
-/**
- * Get all revisions for a page
- * Returns array with revision info
- */
 function getRevisions(string $pageName): array
 {
+    $validatedName = validatePageName($pageName);
+    if ($validatedName === null) {
+        logMessage("Invalid page name in getRevisions: $pageName", 'ERROR');
+        return [];
+    }
     $pagesDir = PAGES_DIR;
-    $pattern = $pagesDir . '/' . $pageName . '.md.rev.*';
+    $pattern = $pagesDir . '/' . $validatedName . '.md.rev.*';
     $files = glob($pattern);
-    
     if ($files === false) {
         return [];
     }
-    
     $revisions = [];
-    
     foreach ($files as $file) {
-        // Skip .meta files
         if (strpos($file, '.meta') !== false) {
             continue;
         }
-        
-        // Extract timestamp from filename
+        if (!validateFilePath($file, $pagesDir)) {
+            logMessage("Invalid file path in getRevisions: $file", 'ERROR');
+            continue;
+        }
         if (preg_match('/\.md\.rev\.(\d+)$/', $file, $matches)) {
             $timestamp = (int)$matches[1];
-            
-            // Try to load metadata
             $metaFile = $file . '.meta';
             $user = 'unknown';
             if (file_exists($metaFile)) {
-                $meta = json_decode(file_get_contents($metaFile), true);
+                $meta = json_decode(@file_get_contents($metaFile), true);
                 if (is_array($meta) && isset($meta['user'])) {
                     $user = $meta['user'];
                 }
             }
-            
             $revisions[] = [
                 'timestamp' => $timestamp,
                 'date' => date('Y-m-d H:i:s', $timestamp),
@@ -372,125 +373,99 @@ function getRevisions(string $pageName): array
             ];
         }
     }
-    
-    // Sort by timestamp descending (newest first)
     usort($revisions, function($a, $b) {
         return $b['timestamp'] - $a['timestamp'];
     });
-    
     return $revisions;
 }
 
-/**
- * Get content of a specific revision
- */
 function getRevisionContent(string $pageName, int $timestamp): ?string
 {
+    $validatedName = validatePageName($pageName);
+    if ($validatedName === null) {
+        return null;
+    }
     $pagesDir = PAGES_DIR;
-    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
-    
+    $revisionFile = $pagesDir . '/' . $validatedName . '.md.rev.' . $timestamp;
+    if (!validateFilePath($revisionFile, $pagesDir)) {
+        logMessage("Invalid file path in getRevisionContent: $revisionFile", 'ERROR');
+        return null;
+    }
     if (!file_exists($revisionFile)) {
         return null;
     }
-    
-    $content = file_get_contents($revisionFile);
+    $content = @file_get_contents($revisionFile);
     return $content !== false ? $content : null;
 }
 
-/**
- * Restore a revision
- * Simply copies the revision content back to the main page
- */
 function restoreRevision(string $pageName, int $timestamp, string $user): bool
 {
+    $validatedName = validatePageName($pageName);
+    if ($validatedName === null) {
+        logMessage("Invalid page name in restoreRevision: $pageName", 'ERROR');
+        return false;
+    }
     $pagesDir = PAGES_DIR;
-    $pageFile = $pagesDir . '/' . $pageName . '.md';
-    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
-    
-    // Check if revision exists
+    $pageFile = $pagesDir . '/' . $validatedName . '.md';
+    $revisionFile = $pagesDir . '/' . $validatedName . '.md.rev.' . $timestamp;
+    if (!validateFilePath($pageFile, $pagesDir) || !validateFilePath($revisionFile, $pagesDir)) {
+        logMessage("Invalid file path in restoreRevision", 'ERROR');
+        return false;
+    }
     if (!file_exists($revisionFile)) {
         logMessage("Revision not found: $revisionFile", 'ERROR');
         return false;
     }
-    
-    // Read revision content
-    $revisionContent = file_get_contents($revisionFile);
+    $revisionContent = @file_get_contents($revisionFile);
     if ($revisionContent === false) {
         logMessage("Failed to read revision: $revisionFile", 'ERROR');
         return false;
     }
-    
-    // Save current content as a revision (if page exists and content is different)
     if (file_exists($pageFile)) {
-        $currentContent = file_get_contents($pageFile);
+        $currentContent = @file_get_contents($pageFile);
         if ($currentContent !== false && $currentContent !== $revisionContent) {
-            saveRevision($pageName, $currentContent, $user);
+            saveRevision($validatedName, $currentContent, $user);
         }
     }
-    
-    // Write revision content to main page
-    $result = file_put_contents($pageFile, $revisionContent, LOCK_EX);
-    
+    $result = @file_put_contents($pageFile, $revisionContent, LOCK_EX);
     if ($result === false) {
         logMessage("Failed to restore revision to: $pageFile", 'ERROR');
         return false;
     }
-    
-    chmod($pageFile, 0644);
-    
-    // Update page metadata
+    @chmod($pageFile, 0644);
     savePageMetadata($pageFile, $user);
-    
-    // Clear all caches
     clearAllPageCaches();
-    
-    logMessage("Restored revision for: $pageName (timestamp: $timestamp)", 'INFO');
-    
+    logMessage("Restored revision for: $validatedName (timestamp: $timestamp)", 'INFO');
     return true;
 }
 
-/**
- * Cleanup old revisions - keep only the newest X revisions
- */
 function cleanupOldRevisions(string $pageName): void
 {
     $revisions = getRevisions($pageName);
-    
     if (count($revisions) <= MAX_REVISIONS) {
         return;
     }
-    
-    // Delete oldest revisions (they're already sorted newest first)
     $toDelete = array_slice($revisions, MAX_REVISIONS);
-    
     foreach ($toDelete as $rev) {
         if (isset($rev['file']) && file_exists($rev['file'])) {
-            unlink($rev['file']);
-            
-            // Also delete metadata file
+            @unlink($rev['file']);
             $metaFile = $rev['file'] . '.meta';
             if (file_exists($metaFile)) {
-                unlink($metaFile);
+                @unlink($metaFile);
             }
         }
     }
 }
 
-/**
- * Generate a simple line-by-line diff
- */
 function generateDiff(string $old, string $new): array
 {
     $oldLines = explode("\n", $old);
     $newLines = explode("\n", $new);
-    
     $diff = [];
     $maxLines = max(count($oldLines), count($newLines));
-    
     for ($i = 0; $i < $maxLines; $i++) {
         $oldLine = $oldLines[$i] ?? '';
         $newLine = $newLines[$i] ?? '';
-        
         if ($oldLine === $newLine) {
             $diff[] = ['type' => 'unchanged', 'content' => $oldLine];
         } elseif ($oldLine === '') {
@@ -502,19 +477,18 @@ function generateDiff(string $old, string $new): array
             $diff[] = ['type' => 'added', 'content' => $newLine];
         }
     }
-    
     return $diff;
 }
 
-/**
- * Get revision metadata
- */
 function getRevisionMetadata(string $pageName, int $timestamp): ?array
 {
+    $validatedName = validatePageName($pageName);
+    if ($validatedName === null) {
+        return null;
+    }
     $pagesDir = PAGES_DIR;
-    $revisionFile = $pagesDir . '/' . $pageName . '.md.rev.' . $timestamp;
+    $revisionFile = $pagesDir . '/' . $validatedName . '.md.rev.' . $timestamp;
     $metaFile = $revisionFile . '.meta';
-    
     if (!file_exists($metaFile)) {
         return [
             'user' => 'unknown',
@@ -522,14 +496,70 @@ function getRevisionMetadata(string $pageName, int $timestamp): ?array
             'date' => date('Y-m-d H:i:s', $timestamp)
         ];
     }
-    
-    $meta = json_decode(file_get_contents($metaFile), true);
+    $meta = json_decode(@file_get_contents($metaFile), true);
     return is_array($meta) ? $meta : null;
 }
 
-// -----------------------------
-// Session / cookie helpers
-// -----------------------------
+function deletePage(string $pageName, string $user): bool
+{
+    $validatedName = validatePageName($pageName);
+    if ($validatedName === null) {
+        logMessage("Invalid page name in deletePage: $pageName", 'ERROR');
+        return false;
+    }
+    $protectedPages = ['Home', 'AllPages', 'AllTags', 'RecentChanges'];
+    if (in_array($validatedName, $protectedPages)) {
+        logMessage("Attempt to delete protected page: $validatedName by user: $user", 'WARNING');
+        return false;
+    }
+    $pagesDir = PAGES_DIR;
+    $pageFile = $pagesDir . '/' . $validatedName . '.md';
+    if (!validateFilePath($pageFile, $pagesDir)) {
+        logMessage("Invalid file path in deletePage: $pageFile", 'ERROR');
+        return false;
+    }
+    if (!file_exists($pageFile)) {
+        logMessage("Page not found for deletion: $pageFile", 'ERROR');
+        return false;
+    }
+    $content = @file_get_contents($pageFile);
+    if ($content !== false) {
+        saveRevision($validatedName, $content, $user . ' (before deletion)');
+    }
+    if (!@unlink($pageFile)) {
+        logMessage("Failed to delete page file: $pageFile", 'ERROR');
+        return false;
+    }
+    $metaFile = $pageFile . '.meta';
+    if (file_exists($metaFile)) {
+        @unlink($metaFile);
+    }
+    $revisions = getRevisions($validatedName);
+    foreach ($revisions as $rev) {
+        if (isset($rev['file']) && file_exists($rev['file'])) {
+            @unlink($rev['file']);
+            $revMetaFile = $rev['file'] . '.meta';
+            if (file_exists($revMetaFile)) {
+                @unlink($revMetaFile);
+            }
+        }
+    }
+    clearPageCache($validatedName);
+    clearAllPageCaches();
+    @touch(CACHE_DIR . '/.rebuild_index');
+    logMessage("Page deleted: $validatedName by user: $user", 'INFO');
+    return true;
+}
+
+function getDeletablePages(string $pagesDir = PAGES_DIR): array
+{
+    $allPages = getAllPageNames($pagesDir);
+    $protectedPages = ['Home', 'AllPages', 'AllTags', 'RecentChanges'];
+    return array_filter($allPages, function($page) use ($protectedPages) {
+        return !in_array($page, $protectedPages);
+    });
+}
+
 function clearSessionCookie(): void
 {
     if (isset($_COOKIE[session_name()])) {
@@ -546,13 +576,15 @@ function clearSessionCookie(): void
     }
 }
 
-// -----------------------------
-// CSRF helpers
-// -----------------------------
 function generateCsrfToken(): string
 {
-    if (empty($_SESSION['csrf_token'])) {
+    if (empty($_SESSION['csrf_token']) || empty($_SESSION['csrf_token_time'])) {
         $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+        $_SESSION['csrf_token_time'] = time();
+    }
+    if (time() - $_SESSION['csrf_token_time'] > 3600) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+        $_SESSION['csrf_token_time'] = time();
     }
     return $_SESSION['csrf_token'];
 }
@@ -560,15 +592,16 @@ function generateCsrfToken(): string
 function validateCsrfToken(?string $token): bool
 {
     $stored = $_SESSION['csrf_token'] ?? '';
+    $tokenTime = $_SESSION['csrf_token_time'] ?? 0;
     if (empty($stored) || empty($token)) {
+        return false;
+    }
+    if (time() - $tokenTime > 7200) {
         return false;
     }
     return hash_equals($stored, $token);
 }
 
-// -----------------------------
-// Image upload handler
-// -----------------------------
 function ensureUploadsDir(string $uploadsDir = UPLOADS_DIR): void
 {
     if (!is_dir($uploadsDir)) {
@@ -580,7 +613,7 @@ function ensureUploadsDir(string $uploadsDir = UPLOADS_DIR): void
     $htaccess = $uploadsDir . '/.htaccess';
     if (!file_exists($htaccess)) {
         $content = "Options -Indexes\n<FilesMatch \"\\.(php|phtml|php3|phps)$\">\n    Deny from all\n</FilesMatch>\n";
-        if (file_put_contents($htaccess, $content, LOCK_EX) === false) {
+        if (@file_put_contents($htaccess, $content, LOCK_EX) === false) {
             logMessage("Failed to create .htaccess in uploads directory", 'WARNING');
         }
     }
@@ -619,8 +652,17 @@ function handleImageUpload(array $file, string $uploadsDir = UPLOADS_DIR, int $m
         return ['success' => false, 'message' => 'Invalid MIME type'];
     }
     $extension = $allowedMimes[$mimeType];
-    $filename = date('Y-m-d_His') . '_' . bin2hex(random_bytes(8)) . '.' . $extension;
+    $filename = date('Y-m-d_His') . '_' . bin2hex(random_bytes(12)) . '.' . $extension;
     $targetPath = $uploadsDir . '/' . $filename;
+    $counter = 0;
+    while (file_exists($targetPath) && $counter < 10) {
+        $filename = date('Y-m-d_His') . '_' . bin2hex(random_bytes(12)) . '.' . $extension;
+        $targetPath = $uploadsDir . '/' . $filename;
+        $counter++;
+    }
+    if (file_exists($targetPath)) {
+        return ['success' => false, 'message' => 'Failed to generate unique filename'];
+    }
     $srcImg = null;
     switch ($mimeType) {
         case 'image/jpeg':
@@ -671,21 +713,25 @@ function handleImageUpload(array $file, string $uploadsDir = UPLOADS_DIR, int $m
     if (!$saved) {
         return ['success' => false, 'message' => 'Failed to save processed image'];
     }
-    chmod($targetPath, 0644);
+    @chmod($targetPath, 0644);
     return ['success' => true, 'filename' => $filename];
 }
 
-// -----------------------------
-// Tag extraction functions
-// -----------------------------
 function cleanContentForTags(string $content): string
 {
     $lines = explode("\n", $content);
     $cleanedLines = [];
     $inCodeBlock = false;
+    $codeBlockDelimiter = '';
     foreach ($lines as $line) {
-        if (preg_match('/^\s*```/', $line)) {
-            $inCodeBlock = !$inCodeBlock;
+        if (preg_match('/^\s*(```|~~~)/', $line, $matches)) {
+            if (!$inCodeBlock) {
+                $inCodeBlock = true;
+                $codeBlockDelimiter = $matches[1];
+            } elseif ($matches[1] === $codeBlockDelimiter) {
+                $inCodeBlock = false;
+                $codeBlockDelimiter = '';
+            }
             continue;
         }
         if ($inCodeBlock) {
@@ -722,11 +768,13 @@ function getAllTags(string $pagesDir = PAGES_DIR, int $maxTagLength = MAX_TAG_LE
         return [];
     }
     foreach ($files as $filename) {
-        // Skip revision files
         if (strpos($filename, '.md.rev.') !== false) {
             continue;
         }
-        $content = file_get_contents($filename);
+        if (!validateFilePath($filename, $pagesDir)) {
+            continue;
+        }
+        $content = @file_get_contents($filename);
         if ($content === false) {
             continue;
         }
@@ -742,9 +790,6 @@ function getAllTags(string $pagesDir = PAGES_DIR, int $maxTagLength = MAX_TAG_LE
     return $allTags;
 }
 
-// -----------------------------
-// Markdown parsing & sanitization
-// -----------------------------
 function sanitizeTextForAttr(string $s): string {
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
@@ -804,9 +849,6 @@ function parseMarkdown(string $text): string
     return $html;
 }
 
-// -----------------------------
-// Page listing / auto-linking helpers (WITH CACHING)
-// -----------------------------
 function getAllPageNames(string $pagesDir = PAGES_DIR): array
 {
     global $_pageNamesCache, $_pageNamesCacheTime;
@@ -822,8 +864,10 @@ function getAllPageNames(string $pagesDir = PAGES_DIR): array
     $files = glob($pagesDir . '/*.md');
     if ($files !== false) {
         foreach ($files as $f) {
-            // Skip revision files
             if (strpos($f, '.md.rev.') !== false) {
+                continue;
+            }
+            if (!validateFilePath($f, $pagesDir)) {
                 continue;
             }
             $pages[] = basename($f, '.md');
@@ -874,9 +918,6 @@ function parseMarkdownWithAutoLink(string $text, string $pagesDir = PAGES_DIR, s
     return parseMarkdown($text);
 }
 
-// -----------------------------
-// Caching functions
-// -----------------------------
 function getCachedHtml(string $pageName, string $content): ?string
 {
     $cacheDir = CACHE_DIR;
@@ -891,11 +932,11 @@ function getCachedHtml(string $pageName, string $content): ?string
         return null;
     }
     $currentHash = md5($content);
-    $cachedHash = file_get_contents($hashFile);
+    $cachedHash = @file_get_contents($hashFile);
     if ($currentHash !== $cachedHash) {
         return null;
     }
-    return file_get_contents($cacheFile);
+    return @file_get_contents($cacheFile);
 }
 
 function setCachedHtml(string $pageName, string $content, string $html): bool
@@ -909,11 +950,11 @@ function setCachedHtml(string $pageName, string $content, string $html): bool
     $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
     $hashFile = $cacheFile . '.hash';
     $contentHash = md5($content);
-    $result1 = file_put_contents($cacheFile, $html, LOCK_EX);
-    $result2 = file_put_contents($hashFile, $contentHash, LOCK_EX);
+    $result1 = @file_put_contents($cacheFile, $html, LOCK_EX);
+    $result2 = @file_put_contents($hashFile, $contentHash, LOCK_EX);
     if ($result1 !== false && $result2 !== false) {
-        chmod($cacheFile, 0644);
-        chmod($hashFile, 0644);
+        @chmod($cacheFile, 0644);
+        @chmod($hashFile, 0644);
         return true;
     }
     return false;
@@ -926,10 +967,10 @@ function clearPageCache(string $pageName): void
     $cacheFile = $cacheDir . '/' . md5($pageName) . '.html';
     $hashFile = $cacheFile . '.hash';
     if (file_exists($cacheFile)) {
-        unlink($cacheFile);
+        @unlink($cacheFile);
     }
     if (file_exists($hashFile)) {
-        unlink($hashFile);
+        @unlink($hashFile);
     }
     $_pageNamesCache = null;
 }
@@ -945,7 +986,7 @@ function clearAllPageCaches(): void
     if ($files !== false) {
         foreach ($files as $file) {
             if (file_exists($file)) {
-                unlink($file);
+                @unlink($file);
             }
         }
     }
@@ -953,16 +994,13 @@ function clearAllPageCaches(): void
     if ($hashFiles !== false) {
         foreach ($hashFiles as $file) {
             if (file_exists($file)) {
-                unlink($file);
+                @unlink($file);
             }
         }
     }
     $_pageNamesCache = null;
 }
 
-// -----------------------------
-// Search index functions
-// -----------------------------
 function buildSearchIndex(string $pagesDir = PAGES_DIR): bool
 {
     $index = [];
@@ -971,12 +1009,14 @@ function buildSearchIndex(string $pagesDir = PAGES_DIR): bool
         return false;
     }
     foreach ($files as $file) {
-        // Skip revision files
         if (strpos($file, '.md.rev.') !== false) {
             continue;
         }
+        if (!validateFilePath($file, $pagesDir)) {
+            continue;
+        }
         $pageName = basename($file, '.md');
-        $content = file_get_contents($file);
+        $content = @file_get_contents($file);
         if ($content === false) {
             continue;
         }
@@ -1034,9 +1074,6 @@ function searchWithIndex(string $query, string $pagesDir = PAGES_DIR, int $limit
     return $results;
 }
 
-// -----------------------------
-// Backlinks & related pages
-// -----------------------------
 function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR, int $limit = 20): array
 {
     $backlinks = [];
@@ -1049,8 +1086,10 @@ function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR, int $li
     }
     $count = 0;
     foreach ($files as $file) {
-        // Skip revision files
         if (strpos($file, '.md.rev.') !== false) {
+            continue;
+        }
+        if (!validateFilePath($file, $pagesDir)) {
             continue;
         }
         if ($count >= $limit) {
@@ -1060,7 +1099,7 @@ function getBacklinks(string $currentPage, string $pagesDir = PAGES_DIR, int $li
         if (strcasecmp($pageName, $currentPage) === 0) {
             continue;
         }
-        $content = file_get_contents($file);
+        $content = @file_get_contents($file);
         if ($content === false) {
             continue;
         }
@@ -1084,15 +1123,17 @@ function getRelatedPagesByTags(string $currentPage, string $content, string $pag
         return [];
     }
     foreach ($files as $file) {
-        // Skip revision files
         if (strpos($file, '.md.rev.') !== false) {
+            continue;
+        }
+        if (!validateFilePath($file, $pagesDir)) {
             continue;
         }
         $pageName = basename($file, '.md');
         if (strcasecmp($pageName, $currentPage) === 0) {
             continue;
         }
-        $otherContent = file_get_contents($file);
+        $otherContent = @file_get_contents($file);
         if ($otherContent === false) {
             continue;
         }
@@ -1111,25 +1152,33 @@ function getRelatedPagesByTags(string $currentPage, string $content, string $pag
     return array_slice($related, 0, $limit, true);
 }
 
-// -----------------------------
-// Security headers
-// -----------------------------
 function sendSecurityHeaders(string $nonce): void
 {
-    header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-$nonce'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
+    $csp = implode('; ', [
+        "default-src 'self'",
+        "script-src 'self' 'nonce-$nonce'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: https:",
+        "font-src 'self'",
+        "connect-src 'self'",
+        "media-src 'self'",
+        "object-src 'none'",
+        "frame-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'"
+    ]);
+    header("Content-Security-Policy: $csp");
     header('X-Content-Type-Options: nosniff');
     header('X-Frame-Options: DENY');
-    header('Referrer-Policy: no-referrer-when-downgrade');
-    header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
+    header('Referrer-Policy: strict-origin-when-cross-origin');
+    header('Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()');
     header('X-XSS-Protection: 1; mode=block');
     if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
         header('Strict-Transport-Security: max-age=63072000; includeSubDomains; preload');
     }
 }
 
-// -----------------------------
-// Nonce & rendering helpers
-// -----------------------------
 function generateNonce(): string
 {
     return rtrim(strtr(base64_encode(random_bytes(16)), '+/', '-_'), '=');
@@ -1147,6 +1196,7 @@ function renderNav(string $nonce = ''): void
         <a href="?page=AllPages">All Pages</a>
         <a href="?page=AllTags">All Tags</a>
         <a href="?page=RecentChanges">Recent Changes</a>
+        <a href="?manage=pages">Manage Pages</a>
         <?php if ($loggedIn): ?>
             <form method="post" style="display:inline;">
                 <input type="hidden" name="csrf" value="<?= htmlspecialchars($csrf, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>">
@@ -1185,7 +1235,6 @@ function renderPage(string $title, callable $contentCallback, string $nonce = ''
 function validateUserPasswords(string $usersFile = USERS_FILE): array
 {
     $users = loadUsersFile($usersFile);
-    
     $invalid = [];
     foreach ($users as $username => $hash) {
         $info = password_get_info($hash);
@@ -1207,8 +1256,10 @@ function getRecentChanges(string $pagesDir = PAGES_DIR, int $limit = 50): array
         return [];
     }
     foreach ($files as $file) {
-        // Skip revision files
         if (strpos($file, '.md.rev.') !== false) {
+            continue;
+        }
+        if (!validateFilePath($file, $pagesDir)) {
             continue;
         }
         $pageName = basename($file, '.md');
@@ -1219,7 +1270,7 @@ function getRecentChanges(string $pagesDir = PAGES_DIR, int $limit = 50): array
         $metaFile = $file . '.meta';
         $user = 'unknown';
         if (file_exists($metaFile)) {
-            $meta = json_decode(file_get_contents($metaFile), true);
+            $meta = json_decode(@file_get_contents($metaFile), true);
             if (is_array($meta) && isset($meta['user'])) {
                 $user = $meta['user'];
             }
@@ -1245,9 +1296,9 @@ function savePageMetadata(string $pagePath, string $user): bool
         'timestamp' => time(),
         'date' => date('Y-m-d H:i:s')
     ];
-    $result = file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX);
+    $result = @file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX);
     if ($result !== false) {
-        chmod($metaFile, 0644);
+        @chmod($metaFile, 0644);
         return true;
     }
     return false;
